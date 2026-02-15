@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: ytdlp-service
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://videosync.video,https://cmachine.devthuku.io
+      - key: FILE_TTL_SECONDS
+        value: 300
+      - key: DOWNLOADS_DIR
+        value: /tmp/downloads
+      - key: CLEANUP_INTERVAL_SECONDS
+        value: 60
+      - key: LOG_LEVEL
+        value: INFO
