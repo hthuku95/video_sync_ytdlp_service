@@ -6,7 +6,6 @@ import asyncio
 import base64
 import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional
 import logging
