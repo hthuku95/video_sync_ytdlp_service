@@ -37,10 +37,15 @@ class YouTubeDownloader:
         self._setup_cookies()
 
         # Build extractor args
+        # player_skip=['webpage'] was removed: it prevents cookie auth from working.
+        # With authenticated cookies, webpage loading succeeds and is required.
+        # Without cookies, use it to avoid 429 on the webpage load.
         extractor_args: Dict[str, Any] = {
             'player_client': ['tv_embedded', 'mweb', 'web'],
-            'player_skip': ['webpage'],
         }
+        if not self.cookies_file:
+            extractor_args['player_skip'] = ['webpage']
+
         if self.po_token and self.visitor_data:
             extractor_args['po_token'] = [f'web+{self.po_token}']
             extractor_args['visitor_data'] = [self.visitor_data]
