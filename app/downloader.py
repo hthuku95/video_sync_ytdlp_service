@@ -1,13 +1,25 @@
 """
-YouTube downloader using yt-dlp with anti-bot measures
+YouTube downloader using multiple strategies with automatic fallback.
+
+Strategy order (tried sequentially until one succeeds):
+  1.  yt-dlp ios          — iOS app protocol, bypasses PO token on datacenter IPs
+  2.  yt-dlp ios+cookies  — iOS + authenticated session (if cookies configured)
+  3.  yt-dlp android      — Android app protocol, different extraction path
+  4.  yt-dlp android+cookies — Android + authenticated session
+  5.  yt-dlp tv_embedded  — TV embedded player (less restricted)
+  6.  yt-dlp mweb         — Mobile web client
+  7.  yt-dlp web_creator  — Creator client (different rate limiting)
+  8.  pytubefix IOS       — Completely different Python library, IOS client
+  9.  pytubefix ANDROID   — pytubefix ANDROID client
+  10. pytubefix TV_EMBED  — pytubefix TV_EMBED client
+  11. streamlink          — Independent stream extraction library
 """
 
 import asyncio
 import base64
 import os
-import re
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import logging
 import yt_dlp
 
@@ -16,70 +28,54 @@ from .storage import storage
 
 logger = logging.getLogger(__name__)
 
-# Quality mapping to yt-dlp format selectors
+# Optional library availability flags
+try:
+    import pytubefix  # noqa: F401
+    PYTUBEFIX_AVAILABLE = True
+    logger.info("✅ pytubefix available (strategies 8-10)")
+except ImportError:
+    PYTUBEFIX_AVAILABLE = False
+    logger.warning("⚠️ pytubefix not installed — strategies 8-10 unavailable. Add pytubefix to requirements.txt")
+
+try:
+    import streamlink as _streamlink_check  # noqa: F401
+    STREAMLINK_AVAILABLE = True
+    logger.info("✅ streamlink available (strategy 11)")
+except ImportError:
+    STREAMLINK_AVAILABLE = False
+    logger.warning("⚠️ streamlink not installed — strategy 11 unavailable. Add streamlink to requirements.txt")
+
+# yt-dlp format selectors by quality
 QUALITY_FORMATS = {
-    "360p": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best",
-    "480p": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best",
-    "720p": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
+    "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best",
+    "480p":  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best",
+    "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
     "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
-    "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+    "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+}
+
+# Quality label → max pixel height (for pytubefix stream selection)
+QUALITY_TO_HEIGHT = {
+    "360p": 360,
+    "480p": 480,
+    "720p": 720,
+    "1080p": 1080,
+    "best": 9999,
 }
 
 
 class YouTubeDownloader:
-    """Wrapper around yt-dlp with anti-bot measures"""
+    """Multi-strategy YouTube downloader with automatic fallback."""
 
     def __init__(self):
         self.cookies_file: Optional[str] = None
         self.po_token: Optional[str] = os.getenv('YTDLP_PO_TOKEN')
         self.visitor_data: Optional[str] = os.getenv('YTDLP_VISITOR_DATA')
-
         self._setup_cookies()
 
-        # Build extractor args.
-        # In 2026, YouTube requires PO tokens for datacenter IPs with web/tv_embedded.
-        # 'ios' uses the YouTube iOS app protocol which bypasses this requirement.
-        # 'mediaconnect' is another low-restriction client.
-        # We try ios first, fall back to tv_embedded (works with valid cookies+PO token),
-        # then mweb as last resort.
-        extractor_args: Dict[str, Any] = {
-            'player_client': ['ios', 'tv_embedded', 'mweb'],
-        }
-        # Only skip webpage when no cookies — avoids 429 on initial page load.
-        # When cookies are present, webpage loading is fine (authenticated session).
-        if not self.cookies_file:
-            extractor_args['player_skip'] = ['webpage']
-
-        if self.po_token and self.visitor_data:
-            extractor_args['po_token'] = [f'web+{self.po_token}']
-            extractor_args['visitor_data'] = [self.visitor_data]
-
-        self.base_opts: Dict[str, Any] = {
-            # Anti-bot measures
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'extractor_args': {'youtube': extractor_args},
-            'http_headers': {
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Encoding': 'gzip, deflate',
-                'DNT': '1',
-            },
-
-            # Download settings
-            'merge_output_format': 'mp4',
-            'quiet': False,
-            'no_warnings': False,
-            'extract_flat': False,
-
-            # Retries
-            'retries': 3,
-            'fragment_retries': 3,
-            'file_access_retries': 3,
-        }
-
-        # Attach cookies file if available
-        if self.cookies_file:
-            self.base_opts['cookiefile'] = self.cookies_file
+    # =========================================================================
+    # SETUP HELPERS
+    # =========================================================================
 
     def _setup_cookies(self) -> None:
         """Load YouTube cookies from YTDLP_COOKIES_B64 environment variable."""
@@ -90,7 +86,6 @@ class YouTubeDownloader:
                 "Set YTDLP_COOKIES_B64 to enable cookie authentication."
             )
             return
-
         try:
             cookies_bytes = base64.b64decode(cookies_b64)
             cookies_path = '/tmp/ytdlp_cookies.txt'
@@ -101,103 +96,144 @@ class YouTubeDownloader:
         except Exception as e:
             logger.error(f"❌ Failed to load YouTube cookies: {e}")
 
-    def _get_format_selector(self, quality: str, output_format: str) -> str:
-        """Get yt-dlp format selector based on quality and format"""
-        base_format = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
+    def _build_ytdlp_opts(
+        self,
+        player_clients: List[str],
+        use_cookies: bool = False,
+        skip_webpage: bool = True,
+        output_path: Optional[str] = None,
+        format_selector: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a yt-dlp options dict for the given strategy parameters."""
+        extractor_args: Dict[str, Any] = {
+            'player_client': player_clients,
+        }
+        if skip_webpage:
+            extractor_args['player_skip'] = ['webpage']
+        if self.po_token and self.visitor_data:
+            extractor_args['po_token'] = [f'web+{self.po_token}']
+            extractor_args['visitor_data'] = [self.visitor_data]
 
-        if output_format == "webm":
-            base_format = base_format.replace("mp4", "webm").replace("m4a", "webm")
-        elif output_format == "mkv":
-            base_format = base_format.replace("mp4", "mkv").replace("m4a", "mkv")
+        opts: Dict[str, Any] = {
+            'user_agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/120.0.0.0 Safari/537.36'
+            ),
+            'extractor_args': {'youtube': extractor_args},
+            'http_headers': {
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+            },
+            'merge_output_format': 'mp4',
+            'quiet': True,
+            'no_warnings': True,
+            'retries': 2,
+            'fragment_retries': 2,
+            'file_access_retries': 2,
+        }
 
-        return base_format
+        if use_cookies and self.cookies_file:
+            opts['cookiefile'] = self.cookies_file
+        if output_path:
+            opts['outtmpl'] = output_path
+        if format_selector:
+            opts['format'] = format_selector
+
+        return opts
+
+    # =========================================================================
+    # ERROR CLASSIFICATION
+    # =========================================================================
 
     def _classify_error(self, error_msg: str) -> ErrorDetail:
-        """Classify yt-dlp error into error codes"""
+        """Classify an error string into a structured ErrorDetail."""
         error_lower = error_msg.lower()
 
-        # Private/unavailable videos
-        if any(keyword in error_lower for keyword in ["private", "unavailable", "deleted", "removed", "geo-block"]):
+        if any(kw in error_lower for kw in ["private", "unavailable", "deleted", "removed", "geo-block"]):
             return ErrorDetail(
                 code=ErrorCode.VIDEO_UNAVAILABLE,
                 message="Video is private, deleted, or unavailable",
                 is_transient=False,
-                details={"yt_dlp_error": error_msg}
+                details={"error": error_msg},
             )
 
-        # Bot detection / sign-in required
-        if any(keyword in error_lower for keyword in ["sign in", "bot", "confirm you"]):
+        if any(kw in error_lower for kw in ["sign in", "bot", "confirm you"]):
             return ErrorDetail(
                 code=ErrorCode.RATE_LIMITED,
-                message="YouTube bot detection triggered - sign-in or cookies required",
+                message="YouTube bot detection triggered — sign-in or cookies required",
                 is_transient=True,
                 retry_after_seconds=300,
-                details={"yt_dlp_error": error_msg}
+                details={"error": error_msg},
             )
 
-        # Rate limiting
         if "429" in error_lower or "rate limit" in error_lower or "too many requests" in error_lower:
             return ErrorDetail(
                 code=ErrorCode.RATE_LIMITED,
                 message="Rate limited by YouTube",
                 is_transient=True,
-                retry_after_seconds=300,  # 5 minutes
-                details={"yt_dlp_error": error_msg}
+                retry_after_seconds=300,
+                details={"error": error_msg},
             )
 
-        # Timeout errors
         if "timeout" in error_lower or "timed out" in error_lower:
             return ErrorDetail(
                 code=ErrorCode.DOWNLOAD_TIMEOUT,
                 message="Download timed out",
                 is_transient=True,
                 retry_after_seconds=60,
-                details={"yt_dlp_error": error_msg}
+                details={"error": error_msg},
             )
 
-        # Network errors
-        if any(keyword in error_lower for keyword in ["network", "connection", "resolve", "unreachable"]):
+        if any(kw in error_lower for kw in ["network", "connection", "resolve", "unreachable"]):
             return ErrorDetail(
                 code=ErrorCode.NETWORK_ERROR,
                 message="Network connection error",
                 is_transient=True,
                 retry_after_seconds=30,
-                details={"yt_dlp_error": error_msg}
+                details={"error": error_msg},
             )
 
-        # Disk errors
-        if "disk" in error_lower or "space" in error_lower or "no space" in error_lower:
+        if "disk" in error_lower or "no space" in error_lower:
             return ErrorDetail(
                 code=ErrorCode.DISK_FULL,
                 message="Server disk full",
                 is_transient=True,
-                retry_after_seconds=600,  # 10 minutes
-                details={"yt_dlp_error": error_msg}
+                retry_after_seconds=600,
+                details={"error": error_msg},
             )
 
-        # Invalid URL
-        if "invalid" in error_lower or "malformed" in error_lower or "unsupported" in error_lower:
+        if "invalid" in error_lower or "malformed" in error_lower or "unsupported url" in error_lower:
             return ErrorDetail(
                 code=ErrorCode.INVALID_URL,
                 message="Invalid or unsupported URL",
                 is_transient=False,
-                details={"yt_dlp_error": error_msg}
+                details={"error": error_msg},
             )
 
-        # Generic server error
         return ErrorDetail(
             code=ErrorCode.SERVER_ERROR,
             message="Download failed",
             is_transient=True,
             retry_after_seconds=120,
-            details={"yt_dlp_error": error_msg}
+            details={"error": error_msg},
         )
 
-    def _extract_metadata(self, info: Dict[str, Any]) -> VideoMetadata:
-        """Extract metadata from yt-dlp info dict"""
+    def _is_permanent_error(self, error: ErrorDetail) -> bool:
+        """True if retrying with a different strategy cannot fix this error."""
+        return error.code in (ErrorCode.VIDEO_UNAVAILABLE, ErrorCode.INVALID_URL)
+
+    # =========================================================================
+    # METADATA EXTRACTION
+    # =========================================================================
+
+    def _extract_metadata_from_ytdlp(self, info: Dict[str, Any]) -> VideoMetadata:
+        """Build VideoMetadata from a yt-dlp info dict."""
         return VideoMetadata(
             title=info.get("title", "Unknown"),
-            duration_seconds=info.get("duration", 0.0),
+            duration_seconds=float(info.get("duration") or 0),
             width=info.get("width"),
             height=info.get("height"),
             file_size_bytes=info.get("filesize") or info.get("filesize_approx"),
@@ -209,45 +245,259 @@ class YouTubeDownloader:
             view_count=info.get("view_count"),
             like_count=info.get("like_count"),
             is_live=info.get("is_live", False),
-            is_private=False  # If we got metadata, it's not private
+            is_private=False,
         )
 
-    async def get_info(self, video_url: str) -> tuple[Optional[VideoMetadata], Optional[ErrorDetail]]:
-        """Get video metadata without downloading"""
+    # =========================================================================
+    # INDIVIDUAL STRATEGY IMPLEMENTATIONS
+    # =========================================================================
+
+    async def _run_ytdlp_strategy(
+        self,
+        video_url: str,
+        output_path: Path,
+        format_selector: str,
+        player_clients: List[str],
+        use_cookies: bool,
+        skip_webpage: bool,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
+        """Run a single yt-dlp download with the given options."""
+        opts = self._build_ytdlp_opts(
+            player_clients=player_clients,
+            use_cookies=use_cookies,
+            skip_webpage=skip_webpage,
+            output_path=str(output_path),
+            format_selector=format_selector,
+        )
+
+        def _do_download():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(video_url, download=True)
+
+        loop = asyncio.get_event_loop()
         try:
-            opts = self.base_opts.copy()
-            opts['skip_download'] = True
+            info = await asyncio.wait_for(
+                loop.run_in_executor(None, _do_download),
+                timeout=300,
+            )
+        except asyncio.TimeoutError:
+            return None, None, "yt-dlp strategy timed out after 5 minutes"
+        except yt_dlp.utils.DownloadError as e:
+            return None, None, str(e)
+        except Exception as e:
+            return None, None, str(e)
 
-            def _extract():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(video_url, download=False)
+        if not info:
+            return None, None, "yt-dlp returned no info"
 
-            # Run in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
+        # yt-dlp may save with a slightly different name; find the actual file
+        actual_path = output_path
+        if not actual_path.exists():
+            candidates = sorted(output_path.parent.glob("video.*"), key=lambda p: p.stat().st_size, reverse=True)
+            if candidates:
+                actual_path = candidates[0]
+            else:
+                return None, None, "File not found on disk after yt-dlp download"
+
+        metadata = self._extract_metadata_from_ytdlp(info)
+        metadata.file_size_bytes = actual_path.stat().st_size
+        return actual_path, metadata, None
+
+    async def _run_pytubefix_strategy(
+        self,
+        video_url: str,
+        job_dir: Path,
+        quality: str,
+        client_name: str,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
+        """Run a pytubefix download with the specified client."""
+        if not PYTUBEFIX_AVAILABLE:
+            return None, None, "pytubefix not installed"
+
+        max_height = QUALITY_TO_HEIGHT.get(quality, 720)
+
+        def _do_download():
+            from pytubefix import YouTube
+
+            yt = YouTube(video_url, client=client_name)
+
+            # Prefer progressive mp4 streams (video+audio in one file)
+            progressive_streams = yt.streams.filter(
+                progressive=True, file_extension='mp4'
+            )
+
+            # Pick the highest-resolution stream at or below the requested quality
+            stream = None
+            best_height = 0
+            for s in progressive_streams:
+                if s.resolution:
+                    try:
+                        h = int(s.resolution.rstrip('p'))
+                        if h <= max_height and h > best_height:
+                            best_height = h
+                            stream = s
+                    except ValueError:
+                        pass
+
+            # If nothing within quality limit, just take the best available
+            if stream is None:
+                stream = progressive_streams.get_highest_resolution()
+
+            if stream is None:
+                raise Exception("No MP4 progressive stream available via pytubefix")
+
+            downloaded = stream.download(
+                output_path=str(job_dir),
+                filename="video.mp4",
+            )
+
+            meta = {
+                'title': yt.title or 'Unknown',
+                'duration': yt.length or 0,
+                'video_id': yt.video_id,
+                'channel_id': getattr(yt, 'channel_id', None),
+                'channel_name': yt.author,
+                'view_count': yt.views,
+            }
+            return downloaded, meta
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _do_download),
+                timeout=300,
+            )
+        except asyncio.TimeoutError:
+            return None, None, "pytubefix strategy timed out after 5 minutes"
+        except Exception as e:
+            return None, None, str(e)
+
+        if not result:
+            return None, None, "pytubefix returned no result"
+
+        downloaded_file, meta = result
+        if not downloaded_file or not Path(downloaded_file).exists():
+            return None, None, "pytubefix: file not found after download"
+
+        actual_path = Path(downloaded_file)
+        metadata = VideoMetadata(
+            title=meta.get('title', 'Unknown'),
+            duration_seconds=float(meta.get('duration') or 0),
+            file_size_bytes=actual_path.stat().st_size,
+            format='mp4',
+            video_id=meta.get('video_id'),
+            channel_id=meta.get('channel_id'),
+            channel_name=meta.get('channel_name'),
+            view_count=meta.get('view_count'),
+            is_live=False,
+            is_private=False,
+        )
+        return actual_path, metadata, None
+
+    async def _run_streamlink_strategy(
+        self,
+        video_url: str,
+        job_dir: Path,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
+        """Run a streamlink-based download (works best for live streams and HLS VODs)."""
+        if not STREAMLINK_AVAILABLE:
+            return None, None, "streamlink not installed"
+
+        output_path = job_dir / "video.ts"
+
+        def _do_download():
+            from streamlink import Streamlink
+
+            sl = Streamlink()
+            streams = sl.streams(video_url)
+
+            if not streams:
+                raise Exception("streamlink found no streams for this URL")
+
+            # Quality preference order
+            stream = None
+            for quality_key in ("best", "720p", "480p", "360p", "worst"):
+                if quality_key in streams:
+                    stream = streams[quality_key]
+                    break
+            if stream is None:
+                stream = next(iter(streams.values()))
+
+            fd = stream.open()
+            try:
+                with open(str(output_path), 'wb') as f:
+                    while True:
+                        chunk = fd.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            finally:
+                fd.close()
+
+        loop = asyncio.get_event_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, _do_download),
+                timeout=300,
+            )
+        except asyncio.TimeoutError:
+            return None, None, "streamlink strategy timed out after 5 minutes"
+        except Exception as e:
+            return None, None, str(e)
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            return None, None, "streamlink produced an empty or missing file"
+
+        metadata = VideoMetadata(
+            title="Unknown",
+            duration_seconds=0.0,
+            file_size_bytes=output_path.stat().st_size,
+            format='ts',
+            is_live=False,
+            is_private=False,
+        )
+        return output_path, metadata, None
+
+    # =========================================================================
+    # PUBLIC API
+    # =========================================================================
+
+    async def get_info(self, video_url: str) -> tuple[Optional[VideoMetadata], Optional[ErrorDetail]]:
+        """Get video metadata without downloading."""
+        opts = self._build_ytdlp_opts(
+            player_clients=['ios', 'tv_embedded', 'mweb'],
+            use_cookies=bool(self.cookies_file),
+            skip_webpage=not bool(self.cookies_file),
+        )
+        opts['skip_download'] = True
+
+        def _extract():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(video_url, download=False)
+
+        loop = asyncio.get_event_loop()
+        try:
             info = await loop.run_in_executor(None, _extract)
-
-            if not info:
-                return None, ErrorDetail(
-                    code=ErrorCode.VIDEO_UNAVAILABLE,
-                    message="Could not extract video info",
-                    is_transient=False
-                )
-
-            metadata = self._extract_metadata(info)
-            return metadata, None
-
         except yt_dlp.utils.DownloadError as e:
             logger.error(f"yt-dlp info extraction failed: {e}")
-            error = self._classify_error(str(e))
-            return None, error
+            return None, self._classify_error(str(e))
         except Exception as e:
             logger.error(f"Unexpected error during info extraction: {e}")
             return None, ErrorDetail(
                 code=ErrorCode.SERVER_ERROR,
                 message=f"Unexpected error: {str(e)}",
                 is_transient=True,
-                retry_after_seconds=120
+                retry_after_seconds=120,
             )
+
+        if not info:
+            return None, ErrorDetail(
+                code=ErrorCode.VIDEO_UNAVAILABLE,
+                message="Could not extract video info",
+                is_transient=False,
+            )
+
+        return self._extract_metadata_from_ytdlp(info), None
 
     async def download(
         self,
@@ -255,87 +505,150 @@ class YouTubeDownloader:
         job_id: str,
         quality: str = "720p",
         output_format: str = "mp4",
-        timeout_seconds: int = 3600
+        timeout_seconds: int = 3600,
     ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[ErrorDetail]]:
         """
-        Download video and return (file_path, metadata, error)
-        Returns (Path, metadata, None) on success, (None, None, error) on failure
+        Download a YouTube video using up to 11 strategies with automatic fallback.
+
+        Returns (file_path, metadata, None) on success.
+        Returns (None, None, error) if all strategies fail.
         """
         job_dir = storage.get_job_dir(job_id)
         output_path = job_dir / f"video.{output_format}"
+        format_selector = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
 
-        try:
-            opts = self.base_opts.copy()
-            opts.update({
-                'format': self._get_format_selector(quality, output_format),
-                'outtmpl': str(output_path),
-                'socket_timeout': min(timeout_seconds, 300),  # Max 5 min socket timeout
-            })
+        has_cookies = bool(self.cookies_file)
 
-            def _download():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(video_url, download=True)
-                    return info
+        # Build the ordered strategy list.
+        # Each entry: (display_name, kind, kwargs_dict)
+        # kind = "ytdlp" | "pytubefix" | "streamlink"
+        strategies = []
 
-            # Run download in thread pool with timeout
-            loop = asyncio.get_event_loop()
+        # --- yt-dlp strategies ---
+        # Strategy 1: ios client without cookies — best for datacenter IPs (bypasses PO token)
+        strategies.append(("yt-dlp ios", "ytdlp", {
+            "player_clients": ["ios"], "use_cookies": False, "skip_webpage": True
+        }))
+
+        # Strategy 2: ios + cookies — authenticated session reduces bot detection
+        if has_cookies:
+            strategies.append(("yt-dlp ios+cookies", "ytdlp", {
+                "player_clients": ["ios"], "use_cookies": True, "skip_webpage": False
+            }))
+
+        # Strategy 3: android client — different extraction path, often less blocked
+        strategies.append(("yt-dlp android", "ytdlp", {
+            "player_clients": ["android"], "use_cookies": False, "skip_webpage": True
+        }))
+
+        # Strategy 4: android + cookies
+        if has_cookies:
+            strategies.append(("yt-dlp android+cookies", "ytdlp", {
+                "player_clients": ["android"], "use_cookies": True, "skip_webpage": False
+            }))
+
+        # Strategy 5: tv_embedded — TV embedded player client
+        strategies.append(("yt-dlp tv_embedded", "ytdlp", {
+            "player_clients": ["tv_embedded"],
+            "use_cookies": has_cookies,
+            "skip_webpage": not has_cookies,
+        }))
+
+        # Strategy 6: mweb — mobile web
+        strategies.append(("yt-dlp mweb", "ytdlp", {
+            "player_clients": ["mweb"], "use_cookies": False, "skip_webpage": True
+        }))
+
+        # Strategy 7: web_creator — creator-specific client with different rate limits
+        strategies.append(("yt-dlp web_creator", "ytdlp", {
+            "player_clients": ["web_creator"],
+            "use_cookies": has_cookies,
+            "skip_webpage": not has_cookies,
+        }))
+
+        # --- pytubefix strategies (completely different Python library) ---
+        if PYTUBEFIX_AVAILABLE:
+            strategies.append(("pytubefix IOS", "pytubefix", {"client_name": "IOS"}))
+            strategies.append(("pytubefix ANDROID", "pytubefix", {"client_name": "ANDROID"}))
+            strategies.append(("pytubefix TV_EMBED", "pytubefix", {"client_name": "TV_EMBED"}))
+
+        # --- streamlink strategy (independent stream extractor) ---
+        if STREAMLINK_AVAILABLE:
+            strategies.append(("streamlink", "streamlink", {}))
+
+        total = len(strategies)
+        logger.info(f"🚀 Starting download with {total} strategies: {video_url}")
+
+        last_error: Optional[ErrorDetail] = None
+        all_errors: List[str] = []
+
+        for idx, (name, kind, kwargs) in enumerate(strategies, 1):
+            logger.info(f"🎯 Strategy {idx}/{total}: {name}")
+
+            # Clean up any partial files from previous attempt
+            for leftover in job_dir.glob("video.*"):
+                try:
+                    leftover.unlink()
+                except Exception:
+                    pass
+
+            file_path: Optional[Path] = None
+            metadata: Optional[VideoMetadata] = None
+            error_msg: Optional[str] = None
+
             try:
-                info = await asyncio.wait_for(
-                    loop.run_in_executor(None, _download),
-                    timeout=timeout_seconds
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Download timeout after {timeout_seconds}s: {video_url}")
-                return None, None, ErrorDetail(
-                    code=ErrorCode.DOWNLOAD_TIMEOUT,
-                    message=f"Download exceeded {timeout_seconds}s timeout",
-                    is_transient=True,
-                    retry_after_seconds=60
-                )
-
-            if not info:
-                return None, None, ErrorDetail(
-                    code=ErrorCode.SERVER_ERROR,
-                    message="Download completed but no info returned",
-                    is_transient=True
-                )
-
-            # Verify file exists
-            if not output_path.exists():
-                # yt-dlp might have saved with different extension
-                actual_files = list(job_dir.glob("video.*"))
-                if actual_files:
-                    output_path = actual_files[0]
-                    logger.info(f"File saved as {output_path.name} instead of video.{output_format}")
-                else:
-                    return None, None, ErrorDetail(
-                        code=ErrorCode.SERVER_ERROR,
-                        message="Download reported success but file not found",
-                        is_transient=True
+                if kind == "ytdlp":
+                    file_path, metadata, error_msg = await self._run_ytdlp_strategy(
+                        video_url, output_path, format_selector,
+                        player_clients=kwargs["player_clients"],
+                        use_cookies=kwargs["use_cookies"],
+                        skip_webpage=kwargs["skip_webpage"],
                     )
+                elif kind == "pytubefix":
+                    file_path, metadata, error_msg = await self._run_pytubefix_strategy(
+                        video_url, job_dir, quality,
+                        client_name=kwargs["client_name"],
+                    )
+                elif kind == "streamlink":
+                    file_path, metadata, error_msg = await self._run_streamlink_strategy(
+                        video_url, job_dir,
+                    )
+            except Exception as e:
+                error_msg = f"Unexpected exception in strategy: {e}"
 
-            # Extract metadata
-            metadata = self._extract_metadata(info)
+            # Check for success
+            if file_path and file_path.exists() and file_path.stat().st_size > 0:
+                size_mb = file_path.stat().st_size / 1024 / 1024
+                logger.info(f"✅ Strategy {idx}/{total} ({name}) succeeded! {file_path.name} ({size_mb:.1f} MB)")
+                return file_path, metadata, None
 
-            # Update file size from actual file
-            metadata.file_size_bytes = output_path.stat().st_size
+            # Strategy failed
+            error_summary = error_msg or "unknown error"
+            logger.warning(f"⚠️ Strategy {idx}/{total} ({name}) failed: {error_summary[:120]}")
+            all_errors.append(f"[{name}]: {error_summary[:200]}")
 
-            logger.info(f"Download successful: {video_url} → {output_path} ({metadata.file_size_bytes / 1024 / 1024:.2f} MB)")
-            return output_path, metadata, None
+            if error_msg:
+                classified = self._classify_error(error_msg)
+                last_error = classified
+                if self._is_permanent_error(classified):
+                    logger.error(f"❌ Permanent error — stopping all strategies: {error_summary[:120]}")
+                    break
 
-        except yt_dlp.utils.DownloadError as e:
-            logger.error(f"yt-dlp download failed: {e}")
-            error = self._classify_error(str(e))
-            return None, None, error
-        except Exception as e:
-            logger.error(f"Unexpected download error: {e}")
-            return None, None, ErrorDetail(
-                code=ErrorCode.SERVER_ERROR,
-                message=f"Unexpected error: {str(e)}",
-                is_transient=True,
-                retry_after_seconds=120
-            )
+        # All strategies exhausted
+        logger.error(f"❌ All {total} strategies failed for {video_url}")
+
+        if last_error:
+            last_error.details = {"all_strategy_errors": all_errors}
+            return None, None, last_error
+
+        return None, None, ErrorDetail(
+            code=ErrorCode.SERVER_ERROR,
+            message=f"All {total} download strategies failed",
+            is_transient=True,
+            retry_after_seconds=300,
+            details={"all_strategy_errors": all_errors},
+        )
 
 
-# Global downloader instance
+# Global singleton
 downloader = YouTubeDownloader()
