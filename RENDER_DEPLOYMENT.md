@@ -56,7 +56,7 @@ curl "$SERVICE_URL/api/v1/health"
 1. Go to Render Dashboard
 2. Select: `video-editor-backend` service
 3. Go to: Environment tab
-4. Update: `YTDLP_API_URL=https://ytdlp-service.onrender.com`
+4. Update: `YTDLP_API_URL=https://ytdlp-service-9eae.onrender.com`
 5. Click: "Save Changes"
 6. Wait: 2-3 minutes for restart
 
