@@ -58,6 +58,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"Version: {VERSION}")
     logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
 
+    cookies_configured = bool(os.getenv('YTDLP_COOKIES_B64'))
+    po_token_configured = bool(os.getenv('YTDLP_PO_TOKEN'))
+    logger.info(f"🍪 YouTube cookies: {'configured' if cookies_configured else 'NOT configured (bot detection risk)'}")
+    logger.info(f"🎫 PO token: {'configured' if po_token_configured else 'not set'}")
+
     # Start cleanup scheduler
     await storage.start_cleanup_scheduler()
 

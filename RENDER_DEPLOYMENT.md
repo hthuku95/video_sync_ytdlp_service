@@ -89,6 +89,66 @@ LOG_LEVEL=INFO
 
 ---
 
+## 🍪 Setting Up YouTube Cookies (Required for Production)
+
+YouTube blocks downloads from datacenter IPs without authentication cookies. Without cookies, you will see:
+```
+ERROR: Sign in to confirm you're not a bot.
+WARNING: HTTP Error 429: Too Many Requests
+```
+
+### Step 1: Export Cookies from Chrome
+
+1. Open **Chrome** and open an **Incognito window** (`Ctrl+Shift+N`)
+2. Navigate to `https://www.youtube.com` and **sign in** with a Google account
+3. Install the [**Get cookies.txt LOCALLY**](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) Chrome extension
+4. While on the YouTube tab, click the extension icon
+5. Select **Export** → choose `youtube.com` (not all sites)
+6. Save the file as `cookies.txt`
+
+### Step 2: Base64-Encode the Cookies File
+
+**Linux / Mac:**
+```bash
+base64 -w 0 cookies.txt
+# Copy the entire output (it will be a long single line)
+```
+
+**Windows (PowerShell):**
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))
+```
+
+### Step 3: Add Cookie to Render.com
+
+1. Go to **https://dashboard.render.com**
+2. Select your **ytdlp-service** web service
+3. Click the **Environment** tab
+4. Click **Add Environment Variable**
+5. Set:
+   - **Key:** `YTDLP_COOKIES_B64`
+   - **Value:** *(paste the base64 output from Step 2)*
+6. Click **Save Changes**
+7. The service will automatically redeploy (~2-3 minutes)
+
+### Step 4: Verify Cookies Are Loaded
+
+After redeployment, check the startup logs in Render Dashboard:
+```
+✅ YouTube cookies loaded successfully
+🍪 YouTube cookies: configured
+```
+
+If you see `⚠️ Running without cookies`, the environment variable was not set correctly.
+
+### Notes
+
+- **Cookie expiry:** YouTube cookies expire after ~1 year. Refresh them if downloads start failing again.
+- **Account safety:** Use a throwaway Google account, not your primary account.
+- **Incognito window:** Required to ensure the exported cookies match what yt-dlp uses (no cached sessions).
+
+---
+
 ## ✅ Verification Tests
 
 After deployment, run these tests:

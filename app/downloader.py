@@ -3,8 +3,10 @@ YouTube downloader using yt-dlp with anti-bot measures
 """
 
 import asyncio
+import base64
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional
 import logging
@@ -29,10 +31,25 @@ class YouTubeDownloader:
     """Wrapper around yt-dlp with anti-bot measures"""
 
     def __init__(self):
-        self.base_opts = {
+        self.cookies_file: Optional[str] = None
+        self.po_token: Optional[str] = os.getenv('YTDLP_PO_TOKEN')
+        self.visitor_data: Optional[str] = os.getenv('YTDLP_VISITOR_DATA')
+
+        self._setup_cookies()
+
+        # Build extractor args
+        extractor_args: Dict[str, Any] = {
+            'player_client': ['tv_embedded', 'mweb', 'web'],
+            'player_skip': ['webpage'],
+        }
+        if self.po_token and self.visitor_data:
+            extractor_args['po_token'] = [f'web+{self.po_token}']
+            extractor_args['visitor_data'] = [self.visitor_data]
+
+        self.base_opts: Dict[str, Any] = {
             # Anti-bot measures
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+            'extractor_args': {'youtube': extractor_args},
             'http_headers': {
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -51,6 +68,30 @@ class YouTubeDownloader:
             'fragment_retries': 3,
             'file_access_retries': 3,
         }
+
+        # Attach cookies file if available
+        if self.cookies_file:
+            self.base_opts['cookiefile'] = self.cookies_file
+
+    def _setup_cookies(self) -> None:
+        """Load YouTube cookies from YTDLP_COOKIES_B64 environment variable."""
+        cookies_b64 = os.getenv('YTDLP_COOKIES_B64', '').strip()
+        if not cookies_b64:
+            logger.warning(
+                "⚠️ Running without cookies - downloads may fail due to bot detection. "
+                "Set YTDLP_COOKIES_B64 to enable cookie authentication."
+            )
+            return
+
+        try:
+            cookies_bytes = base64.b64decode(cookies_b64)
+            cookies_path = '/tmp/ytdlp_cookies.txt'
+            with open(cookies_path, 'wb') as f:
+                f.write(cookies_bytes)
+            self.cookies_file = cookies_path
+            logger.info("✅ YouTube cookies loaded successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to load YouTube cookies: {e}")
 
     def _get_format_selector(self, quality: str, output_format: str) -> str:
         """Get yt-dlp format selector based on quality and format"""
@@ -73,6 +114,16 @@ class YouTubeDownloader:
                 code=ErrorCode.VIDEO_UNAVAILABLE,
                 message="Video is private, deleted, or unavailable",
                 is_transient=False,
+                details={"yt_dlp_error": error_msg}
+            )
+
+        # Bot detection / sign-in required
+        if any(keyword in error_lower for keyword in ["sign in", "bot", "confirm you"]):
+            return ErrorDetail(
+                code=ErrorCode.RATE_LIMITED,
+                message="YouTube bot detection triggered - sign-in or cookies required",
+                is_transient=True,
+                retry_after_seconds=300,
                 details={"yt_dlp_error": error_msg}
             )
 
