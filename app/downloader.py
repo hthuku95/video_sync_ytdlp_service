@@ -36,13 +36,17 @@ class YouTubeDownloader:
 
         self._setup_cookies()
 
-        # Build extractor args
-        # player_skip=['webpage'] was removed: it prevents cookie auth from working.
-        # With authenticated cookies, webpage loading succeeds and is required.
-        # Without cookies, use it to avoid 429 on the webpage load.
+        # Build extractor args.
+        # In 2026, YouTube requires PO tokens for datacenter IPs with web/tv_embedded.
+        # 'ios' uses the YouTube iOS app protocol which bypasses this requirement.
+        # 'mediaconnect' is another low-restriction client.
+        # We try ios first, fall back to tv_embedded (works with valid cookies+PO token),
+        # then mweb as last resort.
         extractor_args: Dict[str, Any] = {
-            'player_client': ['tv_embedded', 'mweb', 'web'],
+            'player_client': ['ios', 'tv_embedded', 'mweb'],
         }
+        # Only skip webpage when no cookies — avoids 429 on initial page load.
+        # When cookies are present, webpage loading is fine (authenticated session).
         if not self.cookies_file:
             extractor_args['player_skip'] = ['webpage']
 
