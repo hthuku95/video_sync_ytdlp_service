@@ -2,17 +2,22 @@
 YouTube downloader using multiple strategies with automatic fallback.
 
 Strategy order (tried sequentially until one succeeds):
-  1.  yt-dlp ios          — iOS app protocol, bypasses PO token on datacenter IPs
-  2.  yt-dlp ios+cookies  — iOS + authenticated session (if cookies configured)
-  3.  yt-dlp android      — Android app protocol, different extraction path
-  4.  yt-dlp android+cookies — Android + authenticated session
-  5.  yt-dlp tv_embedded  — TV embedded player (less restricted)
-  6.  yt-dlp mweb         — Mobile web client
-  7.  yt-dlp web_creator  — Creator client (different rate limiting)
-  8.  pytubefix IOS       — Completely different Python library, IOS client
-  9.  pytubefix ANDROID   — pytubefix ANDROID client
-  10. pytubefix TV_EMBED  — pytubefix TV_EMBED client
-  11. streamlink          — Independent stream extraction library
+  1.  yt-dlp ios                  — iOS app protocol, bypasses PO token on datacenter IPs
+  2.  yt-dlp ios+cookies          — iOS + authenticated session (if cookies configured)
+  3.  yt-dlp android              — Android app protocol, different extraction path
+  4.  yt-dlp android+cookies      — Android + authenticated session
+  5.  yt-dlp tv_embedded          — TV embedded player (less restricted)
+  6.  yt-dlp mweb                 — Mobile web client
+  7.  yt-dlp web_creator          — Creator client (different rate limiting)
+  8.  cobalt.tools (api.cobalt.tools) — API proxy, bypasses datacenter IP blocking entirely
+  9.  cobalt.tools (co.wuk.sh)    — Secondary cobalt instance
+  10. invidious (inv.nadeko.net)  — Open-source YouTube frontend; proxies video streams
+  11. invidious (yewtu.be)        — Invidious secondary instance
+  12. invidious (invidious.nerdvpn.de) — Invidious tertiary instance
+  13. pytubefix IOS               — Completely different Python library, IOS client
+  14. pytubefix ANDROID           — pytubefix ANDROID client
+  15. pytubefix TV_EMBED          — pytubefix TV_EMBED client
+  16. streamlink                  — Independent stream extraction library
 """
 
 import asyncio
@@ -394,6 +399,207 @@ class YouTubeDownloader:
         )
         return actual_path, metadata, None
 
+    async def _run_cobalt_strategy(
+        self,
+        video_url: str,
+        job_dir: Path,
+        quality: str,
+        api_url: str,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
+        """Download via cobalt.tools API — proxies through cobalt servers, bypassing datacenter IP blocking."""
+        cobalt_quality = {
+            "360p": "360", "480p": "480", "720p": "720", "1080p": "1080", "best": "max"
+        }.get(quality, "720")
+        output_path = job_dir / "video.mp4"
+
+        def _do_download():
+            import httpx
+
+            # Step 1: request a stream URL from cobalt API
+            try:
+                resp = httpx.post(
+                    api_url,
+                    json={"url": video_url, "videoQuality": cobalt_quality, "downloadMode": "auto"},
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    timeout=30,
+                    follow_redirects=True,
+                )
+            except Exception as e:
+                return None, None, f"cobalt API request failed: {e}"
+
+            if resp.status_code != 200:
+                return None, None, f"cobalt API HTTP {resp.status_code}: {resp.text[:200]}"
+
+            try:
+                data = resp.json()
+            except Exception:
+                return None, None, f"cobalt invalid JSON: {resp.text[:200]}"
+
+            status = data.get("status", "")
+
+            if status == "error":
+                err = data.get("error", {})
+                code = err.get("code", str(err)) if isinstance(err, dict) else str(err)
+                return None, None, f"cobalt error: {code}"
+
+            if status not in ("stream", "redirect", "tunnel", "picker"):
+                return None, None, f"cobalt unexpected status '{status}': {str(data)[:200]}"
+
+            # For "picker" (multiple files) use the first item's URL
+            if status == "picker":
+                items = data.get("picker", [])
+                if not items:
+                    return None, None, "cobalt picker returned no items"
+                stream_url = items[0].get("url")
+            else:
+                stream_url = data.get("url")
+
+            if not stream_url:
+                return None, None, "cobalt returned no stream URL"
+
+            # Step 2: download the proxied file
+            try:
+                with httpx.Client(timeout=300, follow_redirects=True) as client:
+                    with client.stream("GET", stream_url) as resp2:
+                        if resp2.status_code not in (200, 206):
+                            return None, None, f"cobalt stream HTTP {resp2.status_code}"
+                        with open(output_path, "wb") as f:
+                            for chunk in resp2.iter_bytes(65536):
+                                f.write(chunk)
+            except Exception as e:
+                return None, None, f"cobalt download failed: {e}"
+
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                return None, None, "cobalt: empty or missing file after download"
+
+            metadata = VideoMetadata(
+                title="Unknown",
+                duration_seconds=0.0,
+                file_size_bytes=output_path.stat().st_size,
+                format="mp4",
+                is_live=False,
+                is_private=False,
+            )
+            return output_path, metadata, None
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _do_download),
+                timeout=360,
+            )
+        except asyncio.TimeoutError:
+            return None, None, "cobalt strategy timed out after 6 minutes"
+        except Exception as e:
+            return None, None, str(e)
+
+        return result
+
+    async def _run_invidious_strategy(
+        self,
+        video_url: str,
+        job_dir: Path,
+        quality: str,
+        instance: str,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
+        """Download via Invidious instance — proxied through their servers, bypasses YouTube CDN IP-locking."""
+        import re
+
+        vid_match = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", video_url)
+        if not vid_match:
+            return None, None, f"cannot extract video ID from URL: {video_url}"
+        video_id = vid_match.group(1)
+        max_height = QUALITY_TO_HEIGHT.get(quality, 720)
+        output_path = job_dir / "video.mp4"
+
+        def _do_download():
+            import httpx
+
+            # Step 1: fetch video metadata; local=true makes Invidious proxy URLs through its own servers
+            try:
+                resp = httpx.get(
+                    f"{instance}/api/v1/videos/{video_id}",
+                    params={"local": "true"},
+                    timeout=30,
+                )
+            except Exception as e:
+                return None, None, f"Invidious API request failed: {e}"
+
+            if resp.status_code != 200:
+                return None, None, f"Invidious API HTTP {resp.status_code}"
+
+            try:
+                data = resp.json()
+            except Exception:
+                return None, None, "Invidious invalid JSON response"
+
+            if "error" in data:
+                return None, None, f"Invidious error: {data['error']}"
+
+            # Step 2: pick the best format stream
+            format_streams = data.get("formatStreams", [])
+            if not format_streams:
+                return None, None, "Invidious: no format streams available"
+
+            best_stream = None
+            best_height = 0
+            for stream in format_streams:
+                res = stream.get("resolution", "0x0")
+                try:
+                    h = int(res.split("x")[1]) if "x" in res else int(res.rstrip("p"))
+                    if h <= max_height and h > best_height:
+                        best_height = h
+                        best_stream = stream
+                except (ValueError, IndexError):
+                    pass
+
+            if best_stream is None:
+                best_stream = format_streams[-1]  # fallback to last available
+
+            stream_url = best_stream.get("url")
+            if not stream_url:
+                return None, None, "Invidious: stream has no URL"
+
+            # Step 3: download (URL is proxied through Invidious servers when local=true)
+            try:
+                with httpx.Client(timeout=300, follow_redirects=True) as client:
+                    with client.stream("GET", stream_url) as resp2:
+                        if resp2.status_code not in (200, 206):
+                            return None, None, f"Invidious download HTTP {resp2.status_code}"
+                        with open(output_path, "wb") as f:
+                            for chunk in resp2.iter_bytes(65536):
+                                f.write(chunk)
+            except Exception as e:
+                return None, None, f"Invidious download failed: {e}"
+
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                return None, None, "Invidious: empty or missing file after download"
+
+            metadata = VideoMetadata(
+                title=data.get("title", "Unknown"),
+                duration_seconds=float(data.get("lengthSeconds") or 0),
+                file_size_bytes=output_path.stat().st_size,
+                format="mp4",
+                video_id=video_id,
+                view_count=int(data["viewCount"]) if data.get("viewCount") else None,
+                is_live=False,
+                is_private=False,
+            )
+            return output_path, metadata, None
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _do_download),
+                timeout=360,
+            )
+        except asyncio.TimeoutError:
+            return None, None, "Invidious strategy timed out after 6 minutes"
+        except Exception as e:
+            return None, None, str(e)
+
+        return result
+
     async def _run_streamlink_strategy(
         self,
         video_url: str,
@@ -508,7 +714,7 @@ class YouTubeDownloader:
         timeout_seconds: int = 3600,
     ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[ErrorDetail]]:
         """
-        Download a YouTube video using up to 11 strategies with automatic fallback.
+        Download a YouTube video using up to 16 strategies with automatic fallback.
 
         Returns (file_path, metadata, None) on success.
         Returns (None, None, error) if all strategies fail.
@@ -566,6 +772,27 @@ class YouTubeDownloader:
             "skip_webpage": not has_cookies,
         }))
 
+        # --- API-based proxy strategies (bypass datacenter IP blocking entirely) ---
+        # cobalt.tools — downloads YouTube via its own proxy servers, no direct YouTube IP needed
+        strategies.append(("cobalt.tools (api.cobalt.tools)", "cobalt", {
+            "api_url": "https://api.cobalt.tools/",
+        }))
+        # Secondary cobalt instance (community-hosted)
+        strategies.append(("cobalt.tools (co.wuk.sh)", "cobalt", {
+            "api_url": "https://co.wuk.sh/api/json",
+        }))
+
+        # Invidious — open-source YouTube frontend that proxies video streams through its own servers
+        strategies.append(("invidious (inv.nadeko.net)", "invidious", {
+            "instance": "https://inv.nadeko.net",
+        }))
+        strategies.append(("invidious (yewtu.be)", "invidious", {
+            "instance": "https://yewtu.be",
+        }))
+        strategies.append(("invidious (invidious.nerdvpn.de)", "invidious", {
+            "instance": "https://invidious.nerdvpn.de",
+        }))
+
         # --- pytubefix strategies (completely different Python library) ---
         if PYTUBEFIX_AVAILABLE:
             strategies.append(("pytubefix IOS", "pytubefix", {"client_name": "IOS"}))
@@ -603,6 +830,16 @@ class YouTubeDownloader:
                         player_clients=kwargs["player_clients"],
                         use_cookies=kwargs["use_cookies"],
                         skip_webpage=kwargs["skip_webpage"],
+                    )
+                elif kind == "cobalt":
+                    file_path, metadata, error_msg = await self._run_cobalt_strategy(
+                        video_url, job_dir, quality,
+                        api_url=kwargs["api_url"],
+                    )
+                elif kind == "invidious":
+                    file_path, metadata, error_msg = await self._run_invidious_strategy(
+                        video_url, job_dir, quality,
+                        instance=kwargs["instance"],
                     )
                 elif kind == "pytubefix":
                     file_path, metadata, error_msg = await self._run_pytubefix_strategy(
