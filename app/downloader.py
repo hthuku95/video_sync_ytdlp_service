@@ -9,7 +9,10 @@ Strategy order (tried sequentially until one succeeds):
   5.  yt-dlp tv_embedded          — TV embedded player (less restricted)
   6.  yt-dlp mweb                 — Mobile web client
   7.  yt-dlp web_creator          — Creator client (different rate limiting)
-  8.  cobalt.tools (api.cobalt.tools) — API proxy, bypasses datacenter IP blocking entirely
+  7b. yt-dlp web                  — Standard web player fingerprint
+  7c. yt-dlp web_embedded         — Embedded player, different origin policies
+  7d. yt-dlp tv                   — YouTube TV app protocol
+  8.  cobalt.tools (api.cobalt.tools) — API proxy; bypasses IP blocking (needs COBALT_API_TOKEN)
   9.  cobalt.tools (co.wuk.sh)    — Secondary cobalt instance
   10. invidious (inv.nadeko.net)  — Open-source YouTube frontend; proxies video streams
   11. invidious (yewtu.be)        — Invidious secondary instance
@@ -17,7 +20,14 @@ Strategy order (tried sequentially until one succeeds):
   13. pytubefix IOS               — Completely different Python library, IOS client
   14. pytubefix ANDROID           — pytubefix ANDROID client
   15. pytubefix TV_EMBED          — pytubefix TV_EMBED client
-  16. streamlink                  — Independent stream extraction library
+  16. you-get                     — Multi-platform downloader with different extraction mechanism
+  17. streamlink                  — Independent stream extraction library
+
+Environment variables:
+  YTDLP_COOKIES_B64    — Base64-encoded Netscape cookies.txt for authenticated yt-dlp downloads
+  COBALT_API_TOKEN     — cobalt.tools API key (obtain free at https://cobalt.tools/)
+  YTDLP_PO_TOKEN       — YouTube Proof-of-Origin token (advanced, optional)
+  YTDLP_VISITOR_DATA   — YouTube visitor data (paired with PO token)
 """
 
 import asyncio
@@ -50,6 +60,14 @@ except ImportError:
     STREAMLINK_AVAILABLE = False
     logger.warning("⚠️ streamlink not installed — strategy 11 unavailable. Add streamlink to requirements.txt")
 
+try:
+    import you_get  # noqa: F401
+    YOU_GET_AVAILABLE = True
+    logger.info("✅ you-get available (extra strategy)")
+except ImportError:
+    YOU_GET_AVAILABLE = False
+    logger.warning("⚠️ you-get not installed — extra strategy unavailable. Add you-get to requirements.txt")
+
 # yt-dlp format selectors by quality
 QUALITY_FORMATS = {
     "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best",
@@ -76,6 +94,7 @@ class YouTubeDownloader:
         self.cookies_file: Optional[str] = None
         self.po_token: Optional[str] = os.getenv('YTDLP_PO_TOKEN')
         self.visitor_data: Optional[str] = os.getenv('YTDLP_VISITOR_DATA')
+        self.cobalt_api_token: Optional[str] = os.getenv('COBALT_API_TOKEN')
         self._setup_cookies()
 
     # =========================================================================
@@ -416,11 +435,15 @@ class YouTubeDownloader:
             import httpx
 
             # Step 1: request a stream URL from cobalt API
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            if self.cobalt_api_token:
+                headers["Authorization"] = f"Api-Key {self.cobalt_api_token}"
+
             try:
                 resp = httpx.post(
                     api_url,
                     json={"url": video_url, "videoQuality": cobalt_quality, "downloadMode": "auto"},
-                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    headers=headers,
                     timeout=30,
                     follow_redirects=True,
                 )
@@ -600,6 +623,73 @@ class YouTubeDownloader:
 
         return result
 
+    async def _run_you_get_strategy(
+        self,
+        video_url: str,
+        job_dir: Path,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
+        """Download via you-get — a multi-platform downloader with a different extraction mechanism than yt-dlp."""
+        if not YOU_GET_AVAILABLE:
+            return None, None, "you-get not installed"
+
+        def _do_download():
+            import you_get
+            from you_get import common as you_get_common
+
+            # Redirect you-get's output to capture errors
+            import io
+            import contextlib
+
+            # you-get writes to the current directory by default; force our job dir
+            output_file = job_dir / "video"
+
+            # you-get expects sys.argv-style usage; use its download API
+            try:
+                you_get_common.any_download(
+                    video_url,
+                    output_dir=str(job_dir),
+                    output_filename=str(output_file.name),
+                    # Disable interactive prompts
+                    **{}
+                )
+            except SystemExit:
+                pass  # you-get calls sys.exit(0) on success
+            except Exception as e:
+                return None, None, f"you-get error: {e}"
+
+            # Find the downloaded file
+            candidates = sorted(
+                [p for p in job_dir.glob("video*") if p.is_file() and p.stat().st_size > 0],
+                key=lambda p: p.stat().st_size,
+                reverse=True,
+            )
+            if not candidates:
+                return None, None, "you-get: no output file found"
+
+            actual_path = candidates[0]
+            metadata = VideoMetadata(
+                title="Unknown",
+                duration_seconds=0.0,
+                file_size_bytes=actual_path.stat().st_size,
+                format=actual_path.suffix.lstrip(".") or "mp4",
+                is_live=False,
+                is_private=False,
+            )
+            return actual_path, metadata, None
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _do_download),
+                timeout=300,
+            )
+        except asyncio.TimeoutError:
+            return None, None, "you-get strategy timed out after 5 minutes"
+        except Exception as e:
+            return None, None, str(e)
+
+        return result
+
     async def _run_streamlink_strategy(
         self,
         video_url: str,
@@ -772,6 +862,27 @@ class YouTubeDownloader:
             "skip_webpage": not has_cookies,
         }))
 
+        # Strategy 7b: web client — standard web player, different fingerprint than mobile/app clients
+        strategies.append(("yt-dlp web", "ytdlp", {
+            "player_clients": ["web"],
+            "use_cookies": has_cookies,
+            "skip_webpage": not has_cookies,
+        }))
+
+        # Strategy 7c: web_embedded client — embedded player, different origin policies
+        strategies.append(("yt-dlp web_embedded", "ytdlp", {
+            "player_clients": ["web_embedded"],
+            "use_cookies": has_cookies,
+            "skip_webpage": not has_cookies,
+        }))
+
+        # Strategy 7d: tv client (distinct from tv_embedded) — YouTube TV app protocol
+        strategies.append(("yt-dlp tv", "ytdlp", {
+            "player_clients": ["tv"],
+            "use_cookies": has_cookies,
+            "skip_webpage": not has_cookies,
+        }))
+
         # --- API-based proxy strategies (bypass datacenter IP blocking entirely) ---
         # cobalt.tools — downloads YouTube via its own proxy servers, no direct YouTube IP needed
         strategies.append(("cobalt.tools (api.cobalt.tools)", "cobalt", {
@@ -798,6 +909,10 @@ class YouTubeDownloader:
             strategies.append(("pytubefix IOS", "pytubefix", {"client_name": "IOS"}))
             strategies.append(("pytubefix ANDROID", "pytubefix", {"client_name": "ANDROID"}))
             strategies.append(("pytubefix TV_EMBED", "pytubefix", {"client_name": "TV_EMBED"}))
+
+        # --- you-get strategy (independent multi-platform downloader, different from yt-dlp) ---
+        if YOU_GET_AVAILABLE:
+            strategies.append(("you-get", "you_get", {}))
 
         # --- streamlink strategy (independent stream extractor) ---
         if STREAMLINK_AVAILABLE:
@@ -845,6 +960,10 @@ class YouTubeDownloader:
                     file_path, metadata, error_msg = await self._run_pytubefix_strategy(
                         video_url, job_dir, quality,
                         client_name=kwargs["client_name"],
+                    )
+                elif kind == "you_get":
+                    file_path, metadata, error_msg = await self._run_you_get_strategy(
+                        video_url, job_dir,
                     )
                 elif kind == "streamlink":
                     file_path, metadata, error_msg = await self._run_streamlink_strategy(
