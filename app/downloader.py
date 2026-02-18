@@ -86,9 +86,11 @@ try:
     import nodriver  # noqa: F401
     NODRIVER_AVAILABLE = True
     logger.info("✅ nodriver available (browser automation strategy — free Apify alternative)")
-except ImportError:
+except Exception:
+    # Catches ImportError (not installed) and SyntaxError (nodriver cdp/network.py has a
+    # non-UTF-8 byte in a comment that breaks Python 3.14's strict source encoding check).
     NODRIVER_AVAILABLE = False
-    logger.warning("⚠️ nodriver not installed — browser automation strategy unavailable. Add nodriver to requirements.txt")
+    logger.warning("⚠️ nodriver unavailable — browser automation strategy disabled (import failed)")
 
 # yt-dlp format selectors by quality
 QUALITY_FORMATS = {
