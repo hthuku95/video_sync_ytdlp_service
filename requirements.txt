@@ -8,3 +8,4 @@ httpx==0.28.1
 pytubefix>=10.3.6
 streamlink>=8.2.0
 you-get>=0.4.1743
+nodriver>=0.38

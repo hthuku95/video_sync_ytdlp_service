@@ -1,10 +1,29 @@
 FROM python:3.12-slim
 
-# Install system dependencies (ffmpeg for video processing)
+# Install system dependencies including Chromium for browser automation
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     ca-certificates \
+    chromium \
+    chromium-driver \
+    libglib2.0-0 \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
     && rm -rf /var/lib/apt/lists/*
+
+# Set Chromium path for nodriver
+ENV CHROME_BIN=/usr/bin/chromium
 
 # Set working directory
 WORKDIR /app

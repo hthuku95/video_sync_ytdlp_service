@@ -2,6 +2,12 @@
 YouTube downloader using multiple strategies with automatic fallback.
 
 Strategy order (tried sequentially until one succeeds):
+  When YTDLP_PROXY is set, proxy-first strategies are tried first:
+  P1. yt-dlp ios+proxy            — iOS client routed through residential proxy
+  P2. yt-dlp android+proxy        — Android client through residential proxy
+  P3. yt-dlp web+proxy            — Web client through residential proxy
+
+  Standard strategies (all also use proxy if YTDLP_PROXY is set):
   1.  yt-dlp ios                  — iOS app protocol, bypasses PO token on datacenter IPs
   2.  yt-dlp ios+cookies          — iOS + authenticated session (if cookies configured)
   3.  yt-dlp android              — Android app protocol, different extraction path
@@ -12,19 +18,27 @@ Strategy order (tried sequentially until one succeeds):
   7b. yt-dlp web                  — Standard web player fingerprint
   7c. yt-dlp web_embedded         — Embedded player, different origin policies
   7d. yt-dlp tv                   — YouTube TV app protocol
-  8.  cobalt.tools (api.cobalt.tools) — API proxy; bypasses IP blocking (needs COBALT_API_TOKEN)
-  9.  cobalt.tools (co.wuk.sh)    — Secondary cobalt instance
-  10. invidious (inv.nadeko.net)  — Open-source YouTube frontend; proxies video streams
-  11. invidious (yewtu.be)        — Invidious secondary instance
-  12. invidious (invidious.nerdvpn.de) — Invidious tertiary instance
-  13. pytubefix IOS               — Completely different Python library, IOS client
-  14. pytubefix ANDROID           — pytubefix ANDROID client
-  15. pytubefix TV_EMBED          — pytubefix TV_EMBED client
-  16. you-get                     — Multi-platform downloader with different extraction mechanism
-  17. streamlink                  — Independent stream extraction library
+  8.  nodriver (Chrome CDP)       — Real Chrome browser; generates authentic session tokens;
+                                     intercepts signed CDN stream URLs; bypasses bot detection
+                                     without residential proxies (free Apify alternative)
+  9.  cobalt.tools (api.cobalt.tools) — API proxy; bypasses IP blocking (needs COBALT_API_TOKEN)
+  10. cobalt.tools (co.wuk.sh)    — Secondary cobalt instance
+  11. invidious (inv.nadeko.net)  — Open-source YouTube frontend; proxies video streams
+  12. invidious (yewtu.be)        — Invidious secondary instance
+  13. invidious (invidious.nerdvpn.de) — Invidious tertiary instance
+  14. pytubefix IOS               — Completely different Python library, IOS client
+  15. pytubefix ANDROID           — pytubefix ANDROID client
+  16. pytubefix TV_EMBED          — pytubefix TV_EMBED client
+  17. you-get                     — Multi-platform downloader with different extraction mechanism
+  18. streamlink                  — Independent stream extraction library
 
 Environment variables:
   YTDLP_COOKIES_B64    — Base64-encoded Netscape cookies.txt for authenticated yt-dlp downloads
+  YTDLP_PROXY          — HTTP/SOCKS proxy URL for all yt-dlp strategies, e.g.:
+                           http://user:pass@proxy.example.com:8080
+                           socks5://user:pass@proxy.example.com:1080
+                         Use a residential proxy service to bypass YouTube datacenter IP blocking.
+                         Recommended services: Webshare (webshare.io), Smartproxy, Oxylabs
   COBALT_API_TOKEN     — cobalt.tools API key (obtain free at https://cobalt.tools/)
   YTDLP_PO_TOKEN       — YouTube Proof-of-Origin token (advanced, optional)
   YTDLP_VISITOR_DATA   — YouTube visitor data (paired with PO token)
@@ -68,6 +82,14 @@ except ImportError:
     YOU_GET_AVAILABLE = False
     logger.warning("⚠️ you-get not installed — extra strategy unavailable. Add you-get to requirements.txt")
 
+try:
+    import nodriver  # noqa: F401
+    NODRIVER_AVAILABLE = True
+    logger.info("✅ nodriver available (browser automation strategy — free Apify alternative)")
+except ImportError:
+    NODRIVER_AVAILABLE = False
+    logger.warning("⚠️ nodriver not installed — browser automation strategy unavailable. Add nodriver to requirements.txt")
+
 # yt-dlp format selectors by quality
 QUALITY_FORMATS = {
     "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best",
@@ -95,7 +117,10 @@ class YouTubeDownloader:
         self.po_token: Optional[str] = os.getenv('YTDLP_PO_TOKEN')
         self.visitor_data: Optional[str] = os.getenv('YTDLP_VISITOR_DATA')
         self.cobalt_api_token: Optional[str] = os.getenv('COBALT_API_TOKEN')
+        self.proxy: Optional[str] = os.getenv('YTDLP_PROXY')
         self._setup_cookies()
+        if self.proxy:
+            logger.info(f"✅ Residential proxy configured: {self.proxy.split('@')[-1] if '@' in self.proxy else self.proxy}")
 
     # =========================================================================
     # SETUP HELPERS
@@ -165,6 +190,8 @@ class YouTubeDownloader:
             opts['outtmpl'] = output_path
         if format_selector:
             opts['format'] = format_selector
+        if self.proxy:
+            opts['proxy'] = self.proxy
 
         return opts
 
@@ -690,6 +717,147 @@ class YouTubeDownloader:
 
         return result
 
+    async def _run_nodriver_strategy(
+        self,
+        video_url: str,
+        job_dir: Path,
+        quality: str,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
+        """
+        Download via nodriver (headless Chrome with DevTools Protocol).
+
+        Architecture — free equivalent of what Apify's actor does:
+          Apify:    yt-dlp → Residential proxy pool → YouTube → video
+          nodriver: Real Chrome browser → YouTube → signed CDN URL → direct download
+
+        Unlike yt-dlp which sends raw HTTP requests detectable as bots, this launches
+        a real Chromium instance that generates authentic session tokens (PO token,
+        botguard) only produced by real browsers.
+
+        The signed CDN URL is captured within the same browser session/IP, so
+        downloading it from the same IP avoids the 403 that rusty_ytdl was hitting.
+        """
+        if not NODRIVER_AVAILABLE:
+            return None, None, "nodriver not installed"
+
+        import nodriver as uc
+        import httpx
+        import re as _re
+
+        output_path = job_dir / "video.mp4"
+        intercepted_urls: List[str] = []
+        video_title = "Unknown"
+
+        async def _do_browser():
+            nonlocal video_title
+            chrome_path = os.getenv('CHROME_BIN', '/usr/bin/chromium')
+
+            browser = await uc.start(
+                headless=True,
+                browser_executable_path=chrome_path,
+                browser_args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-web-security',
+                    '--autoplay-policy=no-user-gesture-required',
+                ],
+            )
+            try:
+                tab = await browser.get(video_url)
+                # Wait for page to load and player to initialise
+                await tab.sleep(3)
+
+                # Attempt to play video to trigger stream requests
+                try:
+                    await tab.evaluate("""
+                        var v = document.querySelector('video');
+                        if (v) { v.play(); }
+                    """)
+                    await tab.sleep(5)
+                except Exception:
+                    pass
+
+                # Get video title
+                try:
+                    title_el = await tab.find('h1.ytd-video-primary-info-renderer', timeout=3)
+                    if title_el:
+                        video_title = await title_el.get_attribute('textContent') or "Unknown"
+                except Exception:
+                    pass
+
+                # Capture signed googlevideo CDN URLs from rendered page source
+                try:
+                    page_source = await tab.get_content()
+                    urls = _re.findall(
+                        r'https://[a-z0-9-]+\.googlevideo\.com/videoplayback[^"\'\\s>]+',
+                        page_source,
+                    )
+                    intercepted_urls.extend(urls)
+                except Exception:
+                    pass
+
+            finally:
+                try:
+                    browser.stop()
+                except Exception:
+                    pass
+
+        try:
+            await asyncio.wait_for(
+                _do_browser(),
+                timeout=120,  # 2 minutes for the entire browser session
+            )
+        except asyncio.TimeoutError:
+            return None, None, "nodriver browser session timed out after 2 minutes"
+        except Exception as e:
+            return None, None, f"nodriver browser error: {e}"
+
+        if not intercepted_urls:
+            return None, None, "nodriver: no video stream URLs found in page"
+
+        logger.info(f"🌐 nodriver intercepted {len(intercepted_urls)} CDN URL(s)")
+
+        # Deduplicate and clean URLs
+        seen: set = set()
+        unique_urls: List[str] = []
+        for u in intercepted_urls:
+            clean = u.replace('\\u0026', '&').replace('\\/', '/')
+            if clean not in seen:
+                seen.add(clean)
+                unique_urls.append(clean)
+
+        for attempt, stream_url in enumerate(unique_urls[:5], 1):
+            try:
+                logger.info(f"⬇️ nodriver: downloading stream URL {attempt}/{min(len(unique_urls), 5)}")
+                with httpx.Client(timeout=300, follow_redirects=True) as client:
+                    with client.stream('GET', stream_url) as resp:
+                        if resp.status_code not in (200, 206):
+                            logger.warning(f"nodriver stream URL {attempt} returned HTTP {resp.status_code}")
+                            continue
+                        with open(output_path, 'wb') as f:
+                            for chunk in resp.iter_bytes(65536):
+                                f.write(chunk)
+                if output_path.exists() and output_path.stat().st_size > 0:
+                    break
+            except Exception as e:
+                logger.warning(f"nodriver stream URL {attempt} download failed: {e}")
+                continue
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            return None, None, "nodriver: all intercepted stream URLs failed to download"
+
+        metadata = VideoMetadata(
+            title=video_title.strip() or "Unknown",
+            duration_seconds=0.0,
+            file_size_bytes=output_path.stat().st_size,
+            format="mp4",
+            is_live=False,
+            is_private=False,
+        )
+        return output_path, metadata, None
+
     async def _run_streamlink_strategy(
         self,
         video_url: str,
@@ -820,6 +988,20 @@ class YouTubeDownloader:
         # kind = "ytdlp" | "pytubefix" | "streamlink"
         strategies = []
 
+        # --- Proxy-first strategies (prepended when YTDLP_PROXY is set) ---
+        # Residential proxies bypass YouTube's datacenter IP blocking entirely.
+        # These are tried first because they have the highest success probability.
+        if self.proxy:
+            strategies.append(("yt-dlp ios+proxy", "ytdlp", {
+                "player_clients": ["ios"], "use_cookies": False, "skip_webpage": True
+            }))
+            strategies.append(("yt-dlp android+proxy", "ytdlp", {
+                "player_clients": ["android"], "use_cookies": False, "skip_webpage": True
+            }))
+            strategies.append(("yt-dlp web+proxy", "ytdlp", {
+                "player_clients": ["web"], "use_cookies": has_cookies, "skip_webpage": not has_cookies
+            }))
+
         # --- yt-dlp strategies ---
         # Strategy 1: ios client without cookies — best for datacenter IPs (bypasses PO token)
         strategies.append(("yt-dlp ios", "ytdlp", {
@@ -882,6 +1064,13 @@ class YouTubeDownloader:
             "use_cookies": has_cookies,
             "skip_webpage": not has_cookies,
         }))
+
+        # --- Browser automation strategy (free Apify alternative) ---
+        # nodriver launches real Chromium via CDP — generates authentic YouTube session tokens
+        # that raw HTTP requests (yt-dlp, pytubefix, etc.) cannot produce on datacenter IPs.
+        # The signed CDN URL is intercepted and downloaded from the same IP/session → no 403.
+        if NODRIVER_AVAILABLE:
+            strategies.append(("nodriver (Chrome CDP)", "nodriver", {}))
 
         # --- API-based proxy strategies (bypass datacenter IP blocking entirely) ---
         # cobalt.tools — downloads YouTube via its own proxy servers, no direct YouTube IP needed
@@ -964,6 +1153,10 @@ class YouTubeDownloader:
                 elif kind == "you_get":
                     file_path, metadata, error_msg = await self._run_you_get_strategy(
                         video_url, job_dir,
+                    )
+                elif kind == "nodriver":
+                    file_path, metadata, error_msg = await self._run_nodriver_strategy(
+                        video_url, job_dir, quality,
                     )
                 elif kind == "streamlink":
                     file_path, metadata, error_msg = await self._run_streamlink_strategy(
