@@ -12,7 +12,7 @@ Strategy order (tried sequentially until one succeeds):
   2.  yt-dlp ios+cookies          — iOS + authenticated session (if cookies configured)
   3.  yt-dlp android              — Android app protocol, different extraction path
   4.  yt-dlp android+cookies      — Android + authenticated session
-  5.  yt-dlp tv_embedded          — TV embedded player (less restricted)
+  5.  yt-dlp tv_embedded          — TV embedded player (less restricted); bgutil auto-injects PO token
   6.  yt-dlp mweb                 — Mobile web client
   7.  yt-dlp web_creator          — Creator client (different rate limiting)
   7b. yt-dlp web                  — Standard web player fingerprint
@@ -23,17 +23,26 @@ Strategy order (tried sequentially until one succeeds):
                                      without residential proxies (free Apify alternative)
   9.  cobalt.tools (api.cobalt.tools) — API proxy; bypasses IP blocking (needs COBALT_API_TOKEN)
   10. cobalt.tools (co.wuk.sh)    — Secondary cobalt instance
-  11. invidious (inv.nadeko.net)  — Open-source YouTube frontend; proxies video streams
+  11. invidious (inv.nadeko.net)  — Open-source YouTube frontend; proxies video streams through its servers
   12. invidious (yewtu.be)        — Invidious secondary instance
   13. invidious (invidious.nerdvpn.de) — Invidious tertiary instance
-  14. pytubefix IOS               — Completely different Python library, IOS client
-  15. pytubefix ANDROID           — pytubefix ANDROID client
-  16. pytubefix TV_EMBED          — pytubefix TV_EMBED client
-  17. you-get                     — Multi-platform downloader with different extraction mechanism
-  18. streamlink                  — Independent stream extraction library
+  14. invidious (invidious.io)    — Invidious primary domain
+  15. invidious (vid.puffyan.us)  — Long-running community instance
+  16. invidious (invidious.privacydev.net) — Privacy-focused Invidious instance
+  17. invidious (yt.artemislena.eu) — European Invidious instance
+  18. invidious (invidious.flokinet.to) — FlokiNET-hosted Invidious instance
+  19. piped (pipedapi.kavin.rocks) — Piped.video API; routes streams through Piped's proxy CDN
+  20. piped (pipedapi.in.projectsegfau.lt) — Piped secondary API instance
+  21. piped (piped-api.garudalinux.org) — Piped Garuda Linux instance
+  22. pytubefix IOS               — Completely different Python library, IOS client
+  23. pytubefix ANDROID           — pytubefix ANDROID client
+  24. pytubefix TV_EMBED          — pytubefix TV_EMBED client
+  25. you-get                     — Multi-platform downloader with different extraction mechanism
+  26. streamlink                  — Independent stream extraction library
 
 Environment variables:
   YTDLP_COOKIES_B64    — Base64-encoded Netscape cookies.txt for authenticated yt-dlp downloads
+                         Encode your cookies file with: base64 -w 0 cookies.txt
   YTDLP_PROXY          — HTTP/SOCKS proxy URL for all yt-dlp strategies, e.g.:
                            http://user:pass@proxy.example.com:8080
                            socks5://user:pass@proxy.example.com:1080
@@ -652,6 +661,122 @@ class YouTubeDownloader:
 
         return result
 
+    async def _run_piped_strategy(
+        self,
+        video_url: str,
+        job_dir: Path,
+        quality: str,
+        instance: str,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
+        """Download via Piped API — progressive streams proxied through Piped's CDN.
+
+        Piped is an alternative YouTube frontend that proxies ALL stream URLs through
+        its own infrastructure (pipedproxy-*.kavin.rocks etc.), completely bypassing
+        YouTube CDN IP restrictions from Render datacenter IPs.
+
+        Uses videoStreams with videoOnly=false (progressive video+audio combined).
+        """
+        import re
+
+        vid_match = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", video_url)
+        if not vid_match:
+            return None, None, f"cannot extract video ID from URL: {video_url}"
+        video_id = vid_match.group(1)
+        max_height = QUALITY_TO_HEIGHT.get(quality, 720)
+        output_path = job_dir / "video.mp4"
+
+        def _do_download():
+            import httpx
+
+            # Step 1: fetch stream list from Piped API
+            try:
+                resp = httpx.get(
+                    f"{instance}/streams/{video_id}",
+                    timeout=30,
+                    follow_redirects=True,
+                    headers={"Accept": "application/json"},
+                )
+            except Exception as e:
+                return None, None, f"Piped API request failed: {e}"
+
+            if resp.status_code != 200:
+                return None, None, f"Piped API HTTP {resp.status_code}"
+
+            try:
+                data = resp.json()
+            except Exception:
+                return None, None, "Piped invalid JSON response"
+
+            if "error" in data:
+                return None, None, f"Piped error: {data['error']}"
+
+            # Step 2: find best progressive (videoOnly=false) stream within quality limit
+            # Progressive streams contain both video and audio in one file.
+            video_streams = data.get("videoStreams", [])
+            if not video_streams:
+                return None, None, "Piped: no videoStreams in response"
+
+            progressive = [s for s in video_streams if not s.get("videoOnly", True)]
+            if not progressive:
+                # Fall back to any stream if no progressive found
+                progressive = video_streams
+
+            best_stream = None
+            best_height = 0
+            for stream in progressive:
+                h = stream.get("height", 0) or 0
+                if h <= max_height and h > best_height:
+                    best_height = h
+                    best_stream = stream
+
+            if best_stream is None:
+                # Take the first available if nothing fits quality limit
+                best_stream = progressive[0]
+
+            stream_url = best_stream.get("url")
+            if not stream_url:
+                return None, None, "Piped: stream entry has no URL"
+
+            # Step 3: download through Piped's proxied URL
+            try:
+                with httpx.Client(timeout=300, follow_redirects=True) as client:
+                    with client.stream("GET", stream_url) as resp2:
+                        if resp2.status_code not in (200, 206):
+                            return None, None, f"Piped stream HTTP {resp2.status_code}"
+                        with open(output_path, "wb") as f:
+                            for chunk in resp2.iter_bytes(65536):
+                                f.write(chunk)
+            except Exception as e:
+                return None, None, f"Piped download failed: {e}"
+
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                return None, None, "Piped: empty or missing file after download"
+
+            metadata = VideoMetadata(
+                title=data.get("title", "Unknown"),
+                duration_seconds=float(data.get("duration") or 0),
+                file_size_bytes=output_path.stat().st_size,
+                format="mp4",
+                video_id=video_id,
+                view_count=int(data["views"]) if data.get("views") else None,
+                is_live=False,
+                is_private=False,
+            )
+            return output_path, metadata, None
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _do_download),
+                timeout=360,
+            )
+        except asyncio.TimeoutError:
+            return None, None, "Piped strategy timed out after 6 minutes"
+        except Exception as e:
+            return None, None, str(e)
+
+        return result
+
     async def _run_you_get_strategy(
         self,
         video_url: str,
@@ -1085,15 +1210,29 @@ class YouTubeDownloader:
         }))
 
         # Invidious — open-source YouTube frontend that proxies video streams through its own servers
-        strategies.append(("invidious (inv.nadeko.net)", "invidious", {
-            "instance": "https://inv.nadeko.net",
-        }))
-        strategies.append(("invidious (yewtu.be)", "invidious", {
-            "instance": "https://yewtu.be",
-        }))
-        strategies.append(("invidious (invidious.nerdvpn.de)", "invidious", {
-            "instance": "https://invidious.nerdvpn.de",
-        }))
+        # Multiple instances increase chances of finding one accessible from Render's datacenter IP.
+        for inv_instance in [
+            "https://inv.nadeko.net",
+            "https://yewtu.be",
+            "https://invidious.nerdvpn.de",
+            "https://invidious.io",
+            "https://vid.puffyan.us",
+            "https://invidious.privacydev.net",
+            "https://yt.artemislena.eu",
+            "https://invidious.flokinet.to",
+        ]:
+            host = inv_instance.replace("https://", "")
+            strategies.append((f"invidious ({host})", "invidious", {"instance": inv_instance}))
+
+        # Piped — alternative YouTube frontend with its own proxy CDN (pipedproxy-*.kavin.rocks).
+        # Streams are served through Piped's infrastructure, bypassing YouTube CDN IP restrictions.
+        for piped_instance in [
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.in.projectsegfau.lt",
+            "https://piped-api.garudalinux.org",
+        ]:
+            host = piped_instance.replace("https://", "")
+            strategies.append((f"piped ({host})", "piped", {"instance": piped_instance}))
 
         # --- pytubefix strategies (completely different Python library) ---
         if PYTUBEFIX_AVAILABLE:
@@ -1144,6 +1283,11 @@ class YouTubeDownloader:
                     )
                 elif kind == "invidious":
                     file_path, metadata, error_msg = await self._run_invidious_strategy(
+                        video_url, job_dir, quality,
+                        instance=kwargs["instance"],
+                    )
+                elif kind == "piped":
+                    file_path, metadata, error_msg = await self._run_piped_strategy(
                         video_url, job_dir, quality,
                         instance=kwargs["instance"],
                     )
