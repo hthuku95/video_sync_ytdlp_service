@@ -20,3 +20,5 @@ services:
         value: INFO
       - key: GOOGLE_API_KEY
         sync: false   # Set manually in Render dashboard — never committed to git
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/src/.playwright-browsers

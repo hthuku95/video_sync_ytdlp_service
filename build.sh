@@ -5,9 +5,12 @@ echo "=== [1/4] Installing Python dependencies ==="
 pip install -r requirements.txt
 
 echo "=== [2/4] Installing Playwright browsers ==="
+# Store browsers inside the project directory so Render's build cache captures them.
+# Default ~/.cache/ms-playwright/ is outside the cached tree and is lost between deploys.
+export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/.playwright-browsers"
 playwright install chromium
-# Note: --with-deps is omitted — it requires sudo which Render's native runtime doesn't allow.
-# Render's Linux environment has the required system libs (libnss3, libgbm1, etc.) pre-installed.
+echo "  Playwright browsers installed at: $PLAYWRIGHT_BROWSERS_PATH"
+ls "$PLAYWRIGHT_BROWSERS_PATH"
 
 echo "=== [3/4] Cloning bgutil-ytdlp-pot-provider (v1.2.2) ==="
 BGUTIL_DIR="$(pwd)/bgutil_server"
