@@ -420,8 +420,12 @@ class YouTubePlaywrightAgent:
 
                 logger.info(f"[playwright] Navigating to {video_url}")
                 await self.page.goto(
-                    video_url, wait_until="domcontentloaded", timeout=60_000
+                    video_url, wait_until="commit", timeout=90_000
                 )
+                # "commit" fires as soon as response headers arrive — earlier than
+                # "domcontentloaded". Give YouTube's JS player time to initialize
+                # and start issuing CDN requests before we run the interaction phase.
+                await asyncio.sleep(5)
 
                 await self._capture_page_state()
 
