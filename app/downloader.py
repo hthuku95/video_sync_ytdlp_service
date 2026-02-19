@@ -101,6 +101,20 @@ except Exception:
     NODRIVER_AVAILABLE = False
     logger.warning("⚠️ nodriver unavailable — browser automation strategy disabled (import failed)")
 
+try:
+    from .playwright_agent import (
+        YouTubePlaywrightAgent, PLAYWRIGHT_AVAILABLE, LANGCHAIN_GEMINI_AVAILABLE,
+    )
+    logger.info(
+        f"✅ Playwright agent loaded "
+        f"(browser={'available' if PLAYWRIGHT_AVAILABLE else 'missing'}, "
+        f"gemini={'available' if LANGCHAIN_GEMINI_AVAILABLE else 'missing'})"
+    )
+except Exception as e:
+    PLAYWRIGHT_AVAILABLE = False
+    LANGCHAIN_GEMINI_AVAILABLE = False
+    logger.warning(f"⚠️ Playwright agent import failed: {e}")
+
 # yt-dlp format selectors by quality
 QUALITY_FORMATS = {
     "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best",
@@ -1199,6 +1213,15 @@ class YouTubeDownloader:
         if NODRIVER_AVAILABLE:
             strategies.append(("nodriver (Chrome CDP)", "nodriver", {}))
 
+        # Playwright + Gemini: real browser with event-driven CDN URL interception
+        #   8b. playwright+gemini      — Real Chromium (Playwright); event-driven page.on("response")
+        #                               captures signed CDN URLs before page HTML updates; Gemini+FAISS
+        #                               agent handles consent dialogs; downloads from same server IP → no 403
+        if PLAYWRIGHT_AVAILABLE:
+            strategies.append((
+                "playwright+gemini (Chrome CDN interception)", "playwright_gemini", {}
+            ))
+
         # --- API-based proxy strategies (bypass datacenter IP blocking entirely) ---
         # cobalt.tools — downloads YouTube via its own proxy servers, no direct YouTube IP needed
         strategies.append(("cobalt.tools (api.cobalt.tools)", "cobalt", {
@@ -1303,6 +1326,11 @@ class YouTubeDownloader:
                 elif kind == "nodriver":
                     file_path, metadata, error_msg = await self._run_nodriver_strategy(
                         video_url, job_dir, quality,
+                    )
+                elif kind == "playwright_gemini":
+                    agent = YouTubePlaywrightAgent()
+                    file_path, metadata, error_msg = await agent.download(
+                        video_url, job_dir, quality
                     )
                 elif kind == "streamlink":
                     file_path, metadata, error_msg = await self._run_streamlink_strategy(

@@ -18,3 +18,5 @@ services:
         value: 60
       - key: LOG_LEVEL
         value: INFO
+      - key: GOOGLE_API_KEY
+        sync: false   # Set manually in Render dashboard — never committed to git
