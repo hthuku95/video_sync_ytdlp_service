@@ -9,7 +9,7 @@ Why this works where yt-dlp fails:
   yt-dlp:     raw HTTP → YouTube fingerprints as bot from datacenter IP → blocked
   Playwright: real Chromium browser → YouTube JS player generates authentic PO tokens
               → YouTube serves signed CDN URLs → page.on("response") captures them
-              → httpx downloads from SAME server IP the browser used → no 403
+              → ctx.request downloads from SAME browser context (same IP, same cookies) → no 403
 
 Why Playwright > nodriver (disabled Strategy 8):
   nodriver: searched rendered HTML for CDN URLs (fragile; URLs may not appear in HTML)
@@ -388,6 +388,8 @@ class YouTubePlaywrightAgent:
 
         output_path = job_dir / "video.mp4"
         self.intercepted_cdns = []
+        video_title = "Unknown"
+        download_error: Optional[str] = "playwright: no CDN URLs intercepted after playback"
 
         # ── Browser session ──────────────────────────────────────────────────
         try:
@@ -447,6 +449,59 @@ class YouTubePlaywrightAgent:
                 await asyncio.sleep(8)
 
                 video_title = self.page_state.title if self.page_state else "Unknown"
+
+                # ── Download INSIDE browser context ───────────────────────────
+                # Use ctx.request (Playwright's APIRequestContext) rather than httpx.
+                # ctx.request shares the browser context's cookies and network layer,
+                # so it uses the same outbound IP the browser used when YouTube signed
+                # the CDN URL — preventing the ip= mismatch 403 that httpx gets when
+                # Render's multi-NAT routes the browser and a separate Python process
+                # through different gateway IPs.
+                if self.intercepted_cdns:
+                    logger.info(
+                        f"[playwright] {len(self.intercepted_cdns)} CDN URLs captured — "
+                        f"downloading via browser request context"
+                    )
+                    download_error = "playwright: all intercepted CDN URLs failed to download"
+
+                    for i, cdn_url in enumerate(self.intercepted_cdns[:5], 1):
+                        try:
+                            logger.info(
+                                f"[playwright] Trying CDN URL "
+                                f"{i}/{min(len(self.intercepted_cdns), 5)}"
+                            )
+                            api_resp = await ctx.request.get(
+                                cdn_url,
+                                headers={
+                                    "Referer": "https://www.youtube.com/",
+                                    "Origin": "https://www.youtube.com",
+                                },
+                                timeout=300_000,  # 5 minutes
+                            )
+                            if not api_resp.ok:
+                                logger.warning(
+                                    f"[playwright] CDN URL {i} returned HTTP {api_resp.status}"
+                                )
+                                continue
+
+                            body = await api_resp.body()
+                            if not body:
+                                logger.warning(f"[playwright] CDN URL {i} returned empty body")
+                                continue
+
+                            output_path.write_bytes(body)
+                            size_mb = output_path.stat().st_size / 1024 / 1024
+                            logger.info(
+                                f"[playwright] ✅ Downloaded {size_mb:.1f} MB from CDN URL {i}"
+                            )
+                            download_error = None  # success
+                            break
+
+                        except Exception as e:
+                            logger.warning(f"[playwright] CDN URL {i} download error: {e}")
+                            if output_path.exists():
+                                output_path.unlink()
+
                 await browser.close()
 
         except asyncio.TimeoutError:
@@ -454,48 +509,15 @@ class YouTubePlaywrightAgent:
         except Exception as e:
             return None, None, f"playwright browser error: {e}"
 
-        if not self.intercepted_cdns:
-            return None, None, "playwright: no CDN URLs intercepted after playback"
+        if download_error is not None:
+            return None, None, download_error
 
-        logger.info(
-            f"[playwright] {len(self.intercepted_cdns)} CDN URLs captured — attempting download"
+        metadata = VideoMetadata(
+            title=video_title.replace(" - YouTube", "").strip() or "Unknown",
+            duration_seconds=0.0,
+            file_size_bytes=output_path.stat().st_size,
+            format="mp4",
+            is_live=False,
+            is_private=False,
         )
-
-        # ── Download (same IP as browser → URL IP-lock matches) ──────────────
-        import httpx
-
-        for i, cdn_url in enumerate(self.intercepted_cdns[:5], 1):
-            try:
-                logger.info(
-                    f"[playwright] Downloading CDN URL {i}/{min(len(self.intercepted_cdns), 5)}"
-                )
-                with httpx.Client(timeout=300, follow_redirects=True) as client:
-                    with client.stream("GET", cdn_url) as resp:
-                        if resp.status_code not in (200, 206):
-                            logger.warning(
-                                f"[playwright] CDN URL {i} returned HTTP {resp.status_code}"
-                            )
-                            continue
-                        with open(output_path, "wb") as f:
-                            for chunk in resp.iter_bytes(65536):
-                                f.write(chunk)
-
-                if output_path.exists() and output_path.stat().st_size > 0:
-                    size_mb = output_path.stat().st_size / 1024 / 1024
-                    logger.info(f"[playwright] ✅ Downloaded {size_mb:.1f} MB from CDN URL {i}")
-                    metadata = VideoMetadata(
-                        title=video_title.replace(" - YouTube", "").strip() or "Unknown",
-                        duration_seconds=0.0,
-                        file_size_bytes=output_path.stat().st_size,
-                        format="mp4",
-                        is_live=False,
-                        is_private=False,
-                    )
-                    return output_path, metadata, None
-
-            except Exception as e:
-                logger.warning(f"[playwright] CDN URL {i} download error: {e}")
-                if output_path.exists():
-                    output_path.unlink()
-
-        return None, None, "playwright: all intercepted CDN URLs failed to download"
+        return output_path, metadata, None
