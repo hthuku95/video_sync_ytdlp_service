@@ -22,3 +22,9 @@ services:
         sync: false   # Set manually in Render dashboard — never committed to git
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/project/src/.playwright-browsers
+      - key: QDRANT_URL
+        sync: false   # Set manually — same Qdrant instance as Rust video_editor app
+      - key: QDRANT_API_KEY
+        sync: false   # Set manually in Render dashboard
+      - key: DATABASE_URL
+        sync: false   # Set manually — same Neon PostgreSQL as Rust video_editor app
