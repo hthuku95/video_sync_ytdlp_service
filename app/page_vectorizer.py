@@ -73,7 +73,7 @@ class PageVectorizer:
     """
 
     COLLECTION_PREFIX = "playwright_page_"
-    VECTOR_DIM = 768  # gemini-embedding-001 default output dimension
+    VECTOR_DIM = 3072  # gemini-embedding-001 actual default output dimension
 
     def __init__(
         self,
@@ -156,12 +156,19 @@ class PageVectorizer:
             logger.warning(f"[vectorizer] Query embedding error: {e}")
             return []
 
-        # Qdrant search
+        # Normalize query vector dimension to match stored vectors
+        if len(query_vector) != self.VECTOR_DIM:
+            if len(query_vector) < self.VECTOR_DIM:
+                query_vector = query_vector + [0.0] * (self.VECTOR_DIM - len(query_vector))
+            else:
+                query_vector = query_vector[:self.VECTOR_DIM]
+
+        # Qdrant search (qdrant-client >= 1.10 uses query_points; search was removed in 1.10+)
         if self._qdrant:
             try:
-                results = self._qdrant.search(
+                response = self._qdrant.query_points(
                     collection_name=collection_name,
-                    query_vector=query_vector,
+                    query=query_vector,
                     limit=limit,
                     with_payload=True,
                 )
@@ -172,7 +179,7 @@ class PageVectorizer:
                         selector=r.payload.get("selector", ""),
                         text=r.payload.get("text", ""),
                     )
-                    for r in results
+                    for r in response.points
                 ]
             except Exception as e:
                 logger.warning(f"[vectorizer] Qdrant search error: {e}")
