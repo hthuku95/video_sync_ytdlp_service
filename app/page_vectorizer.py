@@ -91,6 +91,7 @@ class PageVectorizer:
                     url=qdrant_url,
                     api_key=qdrant_api_key,
                     timeout=30,
+                    check_compatibility=False,
                 )
                 logger.info(f"✅ PageVectorizer: Qdrant connected at {qdrant_url[:50]}")
             except Exception as e:

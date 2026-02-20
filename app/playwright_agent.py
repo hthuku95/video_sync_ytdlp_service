@@ -671,15 +671,15 @@ class YouTubePlaywrightAgent:
         api_key = os.getenv("GOOGLE_API_KEY")
         if LANGCHAIN_GEMINI_AVAILABLE and api_key:
             self._llm = ChatGoogleGenerativeAI(
-                model="gemini-2.0-flash",
+                model="gemini-3.1-pro-preview",
                 google_api_key=api_key,
-                temperature=0,
+                temperature=1,
             )
             self._embeddings = GoogleGenerativeAIEmbeddings(
                 model="models/gemini-embedding-001",
                 google_api_key=api_key,
             )
-            logger.info("✅ Gemini 2.0 Flash + gemini-embedding-001 initialized")
+            logger.info("✅ gemini-3.1-pro-preview + gemini-embedding-001 initialized")
 
     # ── CDN interceptor (sync handler — fires for every network response) ──────
 
