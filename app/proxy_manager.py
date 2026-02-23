@@ -20,7 +20,13 @@ Usage:
 import asyncio
 import logging
 import os
+import random
 from typing import Dict, List, Optional
+
+# Cap in-memory proxy list to avoid OOM on 512 MB Render instances.
+# 215k proxies × ~700 bytes per Python dict ≈ 145 MB — too much.
+# 1 000 proxies give ample rotation while using < 1 MB.
+_MAX_PROXIES_IN_MEMORY = 1_000
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +55,17 @@ class WebshareProxyManager:
         """
         Parse a Webshare proxy list download response.
         Each line: ip:port:username:password
+
+        Randomly samples up to _MAX_PROXIES_IN_MEMORY lines to avoid OOM
+        on resource-constrained servers (512 MB Render instances).
         """
+        lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+        if len(lines) > _MAX_PROXIES_IN_MEMORY:
+            lines = random.sample(lines, _MAX_PROXIES_IN_MEMORY)
+
         proxies: List[Dict[str, str]] = []
-        for line in text.strip().splitlines():
-            parts = line.strip().split(":")
+        for line in lines:
+            parts = line.split(":")
             if len(parts) >= 4 and all(parts[:4]):
                 ip, port, username, password = parts[0], parts[1], parts[2], parts[3]
                 proxies.append({
@@ -105,7 +118,7 @@ class WebshareProxyManager:
                         if proxies:
                             logger.info(
                                 f"✅ Webshare proxy manager: loaded {len(proxies)} proxies "
-                                f"via download link"
+                                f"via download link (sampled from full list)"
                             )
             except Exception as e:
                 logger.warning(f"⚠️ Webshare download link failed: {e}")
