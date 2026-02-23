@@ -134,6 +134,7 @@ async def download_video(
             quality=request.quality,
             output_format=request.format,
             timeout_seconds=request.timeout_seconds,
+            only_strategy=request.only_strategy,
         )
 
         if error or not file_path:
@@ -260,6 +261,19 @@ async def get_video_info(request: InfoRequest) -> Response:
             metadata=metadata
         ).model_dump(mode='json')
     )
+
+
+@app.get("/api/v1/strategies")
+async def list_strategies():
+    """List all available download strategies with their 1-based index numbers."""
+    strategies = downloader._build_strategy_list()
+    return {
+        "total": len(strategies),
+        "strategies": [
+            {"num": i + 1, "name": name, "kind": kind}
+            for i, (name, kind, _) in enumerate(strategies)
+        ]
+    }
 
 
 @app.get("/api/v1/health", response_model=HealthResponse)

@@ -27,6 +27,7 @@ class DownloadRequest(BaseModel):
     format: Optional[str] = Field("mp4", description="Video format: mp4, webm, mkv")
     prefer_base64: Optional[bool] = Field(False, description="Force base64 encoding instead of URL")
     timeout_seconds: Optional[int] = Field(3600, description="Download timeout in seconds")
+    only_strategy: Optional[int] = Field(None, description="Run only this strategy number (1-based). Use GET /api/v1/strategies to list available strategies.")
 
     class Config:
         json_schema_extra = {

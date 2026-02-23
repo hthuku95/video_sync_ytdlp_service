@@ -1157,29 +1157,9 @@ class YouTubeDownloader:
 
         return self._extract_metadata_from_ytdlp(info), None
 
-    async def download(
-        self,
-        video_url: str,
-        job_id: str,
-        quality: str = "720p",
-        output_format: str = "mp4",
-        timeout_seconds: int = 3600,
-    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[ErrorDetail]]:
-        """
-        Download a YouTube video using up to 16 strategies with automatic fallback.
 
-        Returns (file_path, metadata, None) on success.
-        Returns (None, None, error) if all strategies fail.
-        """
-        job_dir = storage.get_job_dir(job_id)
-        output_path = job_dir / f"video.{output_format}"
-        format_selector = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
-
-        has_cookies = bool(self.cookies_file)
-
-        # Build the ordered strategy list.
-        # Each entry: (display_name, kind, kwargs_dict)
-        # kind = "ytdlp" | "pytubefix" | "streamlink"
+    def _build_strategy_list(self, has_cookies: bool = True):
+        """Return the ordered list of (name, kind, kwargs) strategy tuples."""
         strategies = []
 
         # --- Proxy-first strategies (prepended when YTDLP_PROXY is set) ---
@@ -1324,8 +1304,41 @@ class YouTubeDownloader:
         if STREAMLINK_AVAILABLE:
             strategies.append(("streamlink", "streamlink", {}))
 
+        return strategies
+
+    async def download(
+        self,
+        video_url: str,
+        job_id: str,
+        quality: str = "720p",
+        output_format: str = "mp4",
+        timeout_seconds: int = 3600,
+        only_strategy: Optional[int] = None,
+    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[ErrorDetail]]:
+        """
+        Download a YouTube video using up to 16 strategies with automatic fallback.
+
+        Returns (file_path, metadata, None) on success.
+        Returns (None, None, error) if all strategies fail.
+        """
+        job_dir = storage.get_job_dir(job_id)
+        output_path = job_dir / f"video.{output_format}"
+        format_selector = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
+
+        has_cookies = bool(self.cookies_file)
+        strategies = self._build_strategy_list(has_cookies=has_cookies)
+
         total = len(strategies)
-        logger.info(f"🚀 Starting download with {total} strategies: {video_url}")
+
+        # If caller requested a specific strategy, filter to just that one (1-based index)
+        if only_strategy is not None:
+            if 1 <= only_strategy <= total:
+                strategies = [strategies[only_strategy - 1]]
+                logger.info(f"🎯 Running only strategy {only_strategy}/{total}: {strategies[0][0]}")
+            else:
+                logger.warning(f"⚠️ only_strategy={only_strategy} out of range (1-{total}), running all")
+        else:
+            logger.info(f"🚀 Starting download with {total} strategies: {video_url}")
 
         last_error: Optional[ErrorDetail] = None
         all_errors: List[str] = []
