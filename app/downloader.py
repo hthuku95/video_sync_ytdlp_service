@@ -62,6 +62,7 @@ import logging
 import yt_dlp
 
 from .models import VideoMetadata, ErrorCode, ErrorDetail
+from .proxy_manager import proxy_manager
 from .storage import storage
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,8 @@ class YouTubeDownloader:
         self.po_token: Optional[str] = os.getenv('YTDLP_PO_TOKEN')
         self.visitor_data: Optional[str] = os.getenv('YTDLP_VISITOR_DATA')
         self.cobalt_api_token: Optional[str] = os.getenv('COBALT_API_TOKEN')
-        self.proxy: Optional[str] = os.getenv('YTDLP_PROXY')
+        # YTDLP_PROXY env var takes priority; Webshare proxy fills in if not explicitly set
+        self.proxy: Optional[str] = os.getenv('YTDLP_PROXY') or proxy_manager.get_proxy_url()
         self._setup_cookies()
         if self.proxy:
             logger.info(f"✅ Residential proxy configured: {self.proxy.split('@')[-1] if '@' in self.proxy else self.proxy}")
@@ -188,6 +190,16 @@ class YouTubeDownloader:
             extractor_args['po_token'] = [f'web+{self.po_token}']
             extractor_args['visitor_data'] = [self.visitor_data]
 
+        # Find a usable Node.js binary for solving YouTube's JS signature/n-challenge.
+        # Required by web/mweb/web_creator/web_embedded/tv clients to avoid "format not available".
+        _node_path = os.getenv('NODE_PATH') or os.getenv('NODE_BINARY')
+        if not _node_path:
+            import shutil
+            _node_path = shutil.which('node') or shutil.which('nodejs')
+        js_runtimes: Dict[str, Any] = {}
+        if _node_path:
+            js_runtimes = {'node': {'path': _node_path}}
+
         opts: Dict[str, Any] = {
             'user_agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -208,6 +220,8 @@ class YouTubeDownloader:
             'fragment_retries': 2,
             'file_access_retries': 2,
         }
+        if js_runtimes:
+            opts['js_runtimes'] = js_runtimes
 
         if use_cookies and self.cookies_file:
             opts['cookiefile'] = self.cookies_file
@@ -215,8 +229,11 @@ class YouTubeDownloader:
             opts['outtmpl'] = output_path
         if format_selector:
             opts['format'] = format_selector
-        if self.proxy:
-            opts['proxy'] = self.proxy
+        # self.proxy is set at construction from YTDLP_PROXY env var or proxy_manager;
+        # also check proxy_manager at call time (proxies may have been refreshed since __init__)
+        effective_proxy = self.proxy or proxy_manager.get_proxy_url()
+        if effective_proxy:
+            opts['proxy'] = effective_proxy
 
         return opts
 
@@ -395,6 +412,17 @@ class YouTubeDownloader:
         def _do_download():
             from pytubefix import YouTube
 
+            # Install a global proxy opener for pytubefix (uses urllib.request internally)
+            proxy_url = proxy_manager.get_proxy_url()
+            if proxy_url:
+                import urllib.request
+                proxy_handler = urllib.request.ProxyHandler({
+                    "http": proxy_url,
+                    "https": proxy_url,
+                })
+                opener = urllib.request.build_opener(proxy_handler)
+                urllib.request.install_opener(opener)
+
             yt = YouTube(video_url, client=client_name)
 
             # Prefer progressive mp4 streams (video+audio in one file)
@@ -491,6 +519,7 @@ class YouTubeDownloader:
             if self.cobalt_api_token:
                 headers["Authorization"] = f"Api-Key {self.cobalt_api_token}"
 
+            cobalt_proxy = proxy_manager.get_proxy_url()
             try:
                 resp = httpx.post(
                     api_url,
@@ -498,6 +527,7 @@ class YouTubeDownloader:
                     headers=headers,
                     timeout=30,
                     follow_redirects=True,
+                    **({"proxy": cobalt_proxy} if cobalt_proxy else {}),
                 )
             except Exception as e:
                 return None, None, f"cobalt API request failed: {e}"
@@ -534,7 +564,10 @@ class YouTubeDownloader:
 
             # Step 2: download the proxied file
             try:
-                with httpx.Client(timeout=300, follow_redirects=True) as client:
+                client_kwargs = {"timeout": 300, "follow_redirects": True}
+                if cobalt_proxy:
+                    client_kwargs["proxy"] = cobalt_proxy
+                with httpx.Client(**client_kwargs) as client:
                     with client.stream("GET", stream_url) as resp2:
                         if resp2.status_code not in (200, 206):
                             return None, None, f"cobalt stream HTTP {resp2.status_code}"
@@ -590,12 +623,14 @@ class YouTubeDownloader:
         def _do_download():
             import httpx
 
+            invidious_proxy = proxy_manager.get_proxy_url()
             # Step 1: fetch video metadata; local=true makes Invidious proxy URLs through its own servers
             try:
                 resp = httpx.get(
                     f"{instance}/api/v1/videos/{video_id}",
                     params={"local": "true"},
                     timeout=30,
+                    **({"proxy": invidious_proxy} if invidious_proxy else {}),
                 )
             except Exception as e:
                 return None, None, f"Invidious API request failed: {e}"
@@ -637,7 +672,10 @@ class YouTubeDownloader:
 
             # Step 3: download (URL is proxied through Invidious servers when local=true)
             try:
-                with httpx.Client(timeout=300, follow_redirects=True) as client:
+                client_kwargs = {"timeout": 300, "follow_redirects": True}
+                if invidious_proxy:
+                    client_kwargs["proxy"] = invidious_proxy
+                with httpx.Client(**client_kwargs) as client:
                     with client.stream("GET", stream_url) as resp2:
                         if resp2.status_code not in (200, 206):
                             return None, None, f"Invidious download HTTP {resp2.status_code}"
@@ -702,6 +740,7 @@ class YouTubeDownloader:
         def _do_download():
             import httpx
 
+            piped_proxy = proxy_manager.get_proxy_url()
             # Step 1: fetch stream list from Piped API
             try:
                 resp = httpx.get(
@@ -709,6 +748,7 @@ class YouTubeDownloader:
                     timeout=30,
                     follow_redirects=True,
                     headers={"Accept": "application/json"},
+                    **({"proxy": piped_proxy} if piped_proxy else {}),
                 )
             except Exception as e:
                 return None, None, f"Piped API request failed: {e}"
@@ -753,7 +793,10 @@ class YouTubeDownloader:
 
             # Step 3: download through Piped's proxied URL
             try:
-                with httpx.Client(timeout=300, follow_redirects=True) as client:
+                client_kwargs = {"timeout": 300, "follow_redirects": True}
+                if piped_proxy:
+                    client_kwargs["proxy"] = piped_proxy
+                with httpx.Client(**client_kwargs) as client:
                     with client.stream("GET", stream_url) as resp2:
                         if resp2.status_code not in (200, 206):
                             return None, None, f"Piped stream HTTP {resp2.status_code}"
@@ -801,12 +844,18 @@ class YouTubeDownloader:
             return None, None, "you-get not installed"
 
         def _do_download():
-            import you_get
+            import you_get  # noqa: F401
             from you_get import common as you_get_common
 
+            # Inject proxy via environment variables — you-get respects HTTP_PROXY/HTTPS_PROXY
+            you_get_proxy = proxy_manager.get_proxy_url()
+            if you_get_proxy:
+                os.environ["HTTP_PROXY"] = you_get_proxy
+                os.environ["HTTPS_PROXY"] = you_get_proxy
+
             # Redirect you-get's output to capture errors
-            import io
-            import contextlib
+            import io  # noqa: F401
+            import contextlib  # noqa: F401
 
             # you-get writes to the current directory by default; force our job dir
             output_file = job_dir / "video"
@@ -1014,6 +1063,10 @@ class YouTubeDownloader:
             from streamlink import Streamlink
 
             sl = Streamlink()
+            stream_proxy = proxy_manager.get_proxy_url()
+            if stream_proxy:
+                sl.set_option("http-proxy", stream_proxy)
+                sl.set_option("https-proxy", stream_proxy)
             streams = sl.streams(video_url)
 
             if not streams:

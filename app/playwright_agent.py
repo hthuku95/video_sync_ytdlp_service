@@ -671,15 +671,15 @@ class YouTubePlaywrightAgent:
         api_key = os.getenv("GOOGLE_API_KEY")
         if LANGCHAIN_GEMINI_AVAILABLE and api_key:
             self._llm = ChatGoogleGenerativeAI(
-                model="gemini-3.1-pro-preview",
+                model="gemini-1.5-flash",
                 google_api_key=api_key,
-                temperature=1,
+                temperature=0,
             )
             self._embeddings = GoogleGenerativeAIEmbeddings(
                 model="models/gemini-embedding-001",
                 google_api_key=api_key,
             )
-            logger.info("✅ gemini-3.1-pro-preview + gemini-embedding-001 initialized")
+            logger.info("✅ gemini-1.5-flash + gemini-embedding-001 initialized")
 
     # ── CDN interceptor (sync handler — fires for every network response) ──────
 
@@ -730,7 +730,7 @@ class YouTubePlaywrightAgent:
 
         def _run_sync() -> None:
             try:
-                graph.invoke(initial_state, config={"recursion_limit": 30})
+                graph.invoke(initial_state, config={"recursion_limit": 15})
             except Exception as e:
                 logger.warning(f"[playwright] LangGraph agent error: {e}")
 
@@ -899,6 +899,8 @@ class YouTubePlaywrightAgent:
                         "--disable-blink-features=AutomationControlled",
                     ],
                 )
+                from .proxy_manager import proxy_manager
+                playwright_proxy = proxy_manager.get_playwright_proxy()
                 ctx = await browser.new_context(
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -907,6 +909,7 @@ class YouTubePlaywrightAgent:
                     ),
                     viewport={"width": 1280, "height": 720},
                     locale="en-US",
+                    **({"proxy": playwright_proxy} if playwright_proxy else {}),
                 )
                 page = await ctx.new_page()
                 self._loop = asyncio.get_event_loop()

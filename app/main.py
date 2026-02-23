@@ -29,6 +29,7 @@ from .models import (
     ErrorDetail,
 )
 from .downloader import downloader
+from .proxy_manager import proxy_manager
 from .storage import storage
 
 # Logging configuration
@@ -53,6 +54,8 @@ stats = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for startup/shutdown tasks"""
+    import asyncio as _asyncio
+
     # Startup
     logger.info("🚀 Starting yt-dlp download service...")
     logger.info(f"Version: {VERSION}")
@@ -62,6 +65,11 @@ async def lifespan(app: FastAPI):
     po_token_configured = bool(os.getenv('YTDLP_PO_TOKEN'))
     logger.info(f"🍪 YouTube cookies: {'configured' if cookies_configured else 'NOT configured (bot detection risk)'}")
     logger.info(f"🎫 PO token: {'configured' if po_token_configured else 'not set'}")
+
+    # Fetch residential proxies from Webshare on startup
+    await proxy_manager.refresh()
+    # Start hourly background refresh
+    _asyncio.create_task(proxy_manager.auto_refresh_loop())
 
     # Start cleanup scheduler
     await storage.start_cleanup_scheduler()
