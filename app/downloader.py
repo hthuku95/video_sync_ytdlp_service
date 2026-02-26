@@ -2,16 +2,19 @@
 YouTube downloader using multiple strategies with automatic fallback.
 
 Strategy order (tried sequentially until one succeeds):
-  When YTDLP_PROXY is set, proxy-first strategies are tried first:
-  P1. yt-dlp ios+proxy            — iOS client routed through residential proxy
-  P2. yt-dlp android+proxy        — Android client through residential proxy
+  NO-PROXY fast-path (always tried first — proven to work from Render datacenter IPs, Feb 2026):
+  0a. yt-dlp android (no proxy)   — Android client WITHOUT proxy; fastest path; proven reliable
+  0b. yt-dlp ios (no proxy)       — iOS client WITHOUT proxy; bypasses PO token
+
+  Proxy strategies (tried if YTDLP_PROXY is set and no-proxy path fails):
+  P1. yt-dlp android+proxy        — Android client through residential proxy
+  P2. yt-dlp ios+proxy            — iOS client routed through residential proxy
   P3. yt-dlp web+proxy            — Web client through residential proxy
 
-  Standard strategies (all also use proxy if YTDLP_PROXY is set):
-  1.  yt-dlp ios                  — iOS app protocol, bypasses PO token on datacenter IPs
-  2.  yt-dlp ios+cookies          — iOS + authenticated session (if cookies configured)
-  3.  yt-dlp android              — Android app protocol, different extraction path
-  4.  yt-dlp android+cookies      — Android + authenticated session
+  Standard strategies (use proxy if YTDLP_PROXY is set):
+  1.  yt-dlp android+cookies      — Android + authenticated session
+  2.  yt-dlp ios                  — iOS app protocol, bypasses PO token on datacenter IPs
+  3.  yt-dlp ios+cookies          — iOS + authenticated session (if cookies configured)
   5.  yt-dlp tv_embedded          — TV embedded player (less restricted); bgutil auto-injects PO token
   6.  yt-dlp mweb                 — Mobile web client
   7.  yt-dlp web_creator          — Creator client (different rate limiting)
@@ -179,6 +182,7 @@ class YouTubeDownloader:
         skip_webpage: bool = True,
         output_path: Optional[str] = None,
         format_selector: Optional[str] = None,
+        use_proxy: bool = True,
     ) -> Dict[str, Any]:
         """Build a yt-dlp options dict for the given strategy parameters."""
         extractor_args: Dict[str, Any] = {
@@ -229,11 +233,12 @@ class YouTubeDownloader:
             opts['outtmpl'] = output_path
         if format_selector:
             opts['format'] = format_selector
-        # self.proxy is set at construction from YTDLP_PROXY env var or proxy_manager;
-        # also check proxy_manager at call time (proxies may have been refreshed since __init__)
-        effective_proxy = self.proxy or proxy_manager.get_proxy_url()
-        if effective_proxy:
-            opts['proxy'] = effective_proxy
+        # Apply proxy only if use_proxy=True (android/ios work without proxy from datacenter IPs,
+        # so those strategies intentionally pass use_proxy=False for the no-proxy-first attempt).
+        if use_proxy:
+            effective_proxy = self.proxy or proxy_manager.get_proxy_url()
+            if effective_proxy:
+                opts['proxy'] = effective_proxy
 
         return opts
 
@@ -353,6 +358,7 @@ class YouTubeDownloader:
         player_clients: List[str],
         use_cookies: bool,
         skip_webpage: bool,
+        use_proxy: bool = True,
     ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[str]]:
         """Run a single yt-dlp download with the given options."""
         opts = self._build_ytdlp_opts(
@@ -361,6 +367,7 @@ class YouTubeDownloader:
             skip_webpage=skip_webpage,
             output_path=str(output_path),
             format_selector=format_selector,
+            use_proxy=use_proxy,
         )
 
         def _do_download():
@@ -1162,41 +1169,48 @@ class YouTubeDownloader:
         """Return the ordered list of (name, kind, kwargs) strategy tuples."""
         strategies = []
 
-        # --- Proxy-first strategies (prepended when YTDLP_PROXY is set) ---
-        # Residential proxies bypass YouTube's datacenter IP blocking entirely.
-        # These are tried first because they have the highest success probability.
+        # --- NO-PROXY strategies first (android/ios proven to work from datacenter IPs, Feb 2026) ---
+        # These are tried before any proxy strategies because:
+        #   1. They work from Render's datacenter IP without residential proxies
+        #   2. They are fast (no proxy overhead / timeout)
+        #   3. The proxy-first strategies can take 300s+ to timeout, wasting the caller's window
+        strategies.append(("yt-dlp android (no proxy)", "ytdlp", {
+            "player_clients": ["android"], "use_cookies": False, "skip_webpage": True, "use_proxy": False
+        }))
+        strategies.append(("yt-dlp ios (no proxy)", "ytdlp", {
+            "player_clients": ["ios"], "use_cookies": False, "skip_webpage": True, "use_proxy": False
+        }))
+
+        # --- Proxy-first strategies (tried after no-proxy fast-path fails) ---
+        # Residential proxies bypass YouTube's datacenter IP blocking for clients that need it.
         if self.proxy:
-            strategies.append(("yt-dlp ios+proxy", "ytdlp", {
-                "player_clients": ["ios"], "use_cookies": False, "skip_webpage": True
-            }))
+            # android+proxy — android client through residential proxy
             strategies.append(("yt-dlp android+proxy", "ytdlp", {
-                "player_clients": ["android"], "use_cookies": False, "skip_webpage": True
+                "player_clients": ["android"], "use_cookies": False, "skip_webpage": True, "use_proxy": True
+            }))
+            strategies.append(("yt-dlp ios+proxy", "ytdlp", {
+                "player_clients": ["ios"], "use_cookies": False, "skip_webpage": True, "use_proxy": True
             }))
             strategies.append(("yt-dlp web+proxy", "ytdlp", {
-                "player_clients": ["web"], "use_cookies": has_cookies, "skip_webpage": not has_cookies
+                "player_clients": ["web"], "use_cookies": has_cookies, "skip_webpage": not has_cookies, "use_proxy": True
             }))
 
-        # --- yt-dlp strategies ---
-        # Strategy 1: ios client without cookies — best for datacenter IPs (bypasses PO token)
+        # --- yt-dlp strategies (use proxy if available) ---
+        # android + cookies — android + authenticated session
+        if has_cookies:
+            strategies.append(("yt-dlp android+cookies", "ytdlp", {
+                "player_clients": ["android"], "use_cookies": True, "skip_webpage": False
+            }))
+
+        # ios client without cookies (with proxy if set)
         strategies.append(("yt-dlp ios", "ytdlp", {
             "player_clients": ["ios"], "use_cookies": False, "skip_webpage": True
         }))
 
-        # Strategy 2: ios + cookies — authenticated session reduces bot detection
+        # Strategy 4: ios + cookies — authenticated session reduces bot detection
         if has_cookies:
             strategies.append(("yt-dlp ios+cookies", "ytdlp", {
                 "player_clients": ["ios"], "use_cookies": True, "skip_webpage": False
-            }))
-
-        # Strategy 3: android client — different extraction path, often less blocked
-        strategies.append(("yt-dlp android", "ytdlp", {
-            "player_clients": ["android"], "use_cookies": False, "skip_webpage": True
-        }))
-
-        # Strategy 4: android + cookies
-        if has_cookies:
-            strategies.append(("yt-dlp android+cookies", "ytdlp", {
-                "player_clients": ["android"], "use_cookies": True, "skip_webpage": False
             }))
 
         # Strategy 5: tv_embedded — TV embedded player client
@@ -1364,6 +1378,7 @@ class YouTubeDownloader:
                         player_clients=kwargs["player_clients"],
                         use_cookies=kwargs["use_cookies"],
                         skip_webpage=kwargs["skip_webpage"],
+                        use_proxy=kwargs.get("use_proxy", True),
                     )
                 elif kind == "cobalt":
                     file_path, metadata, error_msg = await self._run_cobalt_strategy(
