@@ -303,7 +303,23 @@ class YouTubeDownloader:
                 details={"error": error_msg},
             )
 
-        if "invalid" in error_lower or "malformed" in error_lower or "unsupported url" in error_lower:
+        # "invalid json", "piped invalid", "invidious invalid" etc. are transient proxy errors,
+        # NOT a signal that the URL itself is invalid — don't stop all strategies for these.
+        if any(kw in error_lower for kw in ["invalid json", "piped invalid", "piped error", "invidious error",
+                                             "cobalt error", "json decode", "json parse"]):
+            return ErrorDetail(
+                code=ErrorCode.NETWORK_ERROR,
+                message="Proxy/mirror returned invalid response — trying next strategy",
+                is_transient=True,
+                retry_after_seconds=5,
+                details={"error": error_msg},
+            )
+
+        # Only treat as a true invalid URL if yt-dlp itself (not a proxy) says so
+        if "unsupported url" in error_lower or "is not a valid url" in error_lower or (
+            ("invalid" in error_lower or "malformed" in error_lower)
+            and not any(kw in error_lower for kw in ["json", "response", "piped", "invidious", "cobalt"])
+        ):
             return ErrorDetail(
                 code=ErrorCode.INVALID_URL,
                 message="Invalid or unsupported URL",
