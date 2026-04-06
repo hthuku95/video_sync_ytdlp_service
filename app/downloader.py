@@ -306,7 +306,8 @@ class YouTubeDownloader:
         # "invalid json", "piped invalid", "invidious invalid" etc. are transient proxy errors,
         # NOT a signal that the URL itself is invalid — don't stop all strategies for these.
         if any(kw in error_lower for kw in ["invalid json", "piped invalid", "piped error", "invidious error",
-                                             "cobalt error", "json decode", "json parse"]):
+                                             "invidious invalid", "cobalt error", "cobalt invalid",
+                                             "json decode", "json parse"]):
             return ErrorDetail(
                 code=ErrorCode.NETWORK_ERROR,
                 message="Proxy/mirror returned invalid response — trying next strategy",
