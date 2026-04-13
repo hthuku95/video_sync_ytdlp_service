@@ -29,9 +29,32 @@ class StorageManager:
         self._init_storage()
 
     def _init_storage(self):
-        """Initialize storage directory"""
+        """Initialize storage directory and wipe any orphans from a prior crash.
+
+        Render restarts can leave hundreds of `job_*` dirs full of `.part` /
+        `.ytdl` files that the running cleanup loop never gets to (because the
+        crashed process owned them). Wipe everything older than 5 minutes on
+        boot so a crash-restart cycle can never accumulate disk pressure.
+        """
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Storage initialized at {self.downloads_dir} (TTL: {self.file_ttl}s)")
+        wiped = 0
+        if self.downloads_dir.exists():
+            now = time.time()
+            for d in self.downloads_dir.iterdir():
+                if not d.is_dir():
+                    continue
+                # If anything in here is older than 5 min, the job is dead.
+                try:
+                    ages = [now - f.stat().st_mtime for f in d.rglob("*") if f.is_file()]
+                    if ages and min(ages) > 300:
+                        shutil.rmtree(d)
+                        wiped += 1
+                except Exception as e:
+                    logger.warning(f"startup cleanup: failed on {d.name}: {e}")
+        logger.info(
+            f"Storage initialized at {self.downloads_dir} "
+            f"(TTL: {self.file_ttl}s, wiped {wiped} orphan job dirs at boot)"
+        )
 
     def get_job_dir(self, job_id: str) -> Path:
         """Get directory for a specific job"""
@@ -73,41 +96,85 @@ class StorageManager:
                 logger.error(f"Failed to delete job files {job_id}: {e}")
 
     def cleanup_old_files(self):
-        """Remove files older than TTL"""
+        """Remove job dirs whose newest file is older than TTL, plus run a
+        disk-pressure pass that drops oldest dirs first when usage > 80%.
+
+        Old behavior used `min(ages) > TTL` (any file expired ⇒ wipe), which
+        deleted in-progress jobs that had a stale temp file. New behavior uses
+        `max(ages) > TTL` (nothing has been written for TTL ⇒ truly idle).
+        """
         if not self.downloads_dir.exists():
             return
 
         removed_count = 0
         removed_bytes = 0
+        now = time.time()
+
+        # Snapshot dir ages so we can age-sort for disk-pressure pass.
+        dir_ages: list[tuple[Path, float, int]] = []  # (path, newest_mtime, size)
 
         for job_dir in self.downloads_dir.iterdir():
             if not job_dir.is_dir():
                 continue
 
-            # Check all files in job directory
-            should_delete = False
-            for file_path in job_dir.rglob("*"):
-                if not file_path.is_file():
-                    continue
-
-                age = time.time() - file_path.stat().st_mtime
-                if age > self.file_ttl:
-                    should_delete = True
-                    break
-
-            # Delete entire job directory if any file is expired
-            if should_delete:
+            files = [f for f in job_dir.rglob("*") if f.is_file()]
+            if not files:
+                # empty dir — sweep it
                 try:
-                    size = sum(f.stat().st_size for f in job_dir.rglob("*") if f.is_file())
+                    job_dir.rmdir()
+                except OSError:
+                    pass
+                continue
+
+            newest = max(f.stat().st_mtime for f in files)
+            size = sum(f.stat().st_size for f in files)
+            dir_ages.append((job_dir, newest, size))
+
+            # TTL pass: delete idle jobs (nothing written for `file_ttl` seconds).
+            if (now - newest) > self.file_ttl:
+                try:
                     shutil.rmtree(job_dir)
                     removed_count += 1
                     removed_bytes += size
-                    logger.info(f"Cleaned up expired job: {job_dir.name} ({size / 1024 / 1024:.2f} MB)")
+                    logger.info(
+                        f"Cleaned up idle job: {job_dir.name} "
+                        f"({size / 1024 / 1024:.2f} MB)"
+                    )
                 except Exception as e:
                     logger.error(f"Failed to cleanup {job_dir.name}: {e}")
 
+        # Disk-pressure pass: if usage still > 80% after TTL pass, drop the
+        # oldest job dirs (active or not) until we're under 70%. Better to
+        # fail one in-flight download than to brick the whole service.
+        usage = self.get_disk_usage()
+        if usage > 80.0:
+            logger.warning(
+                f"Disk usage {usage:.1f}% > 80%, running pressure cleanup"
+            )
+            # Re-list (TTL pass deleted some). Sort oldest-first.
+            survivors = [
+                (d, m, s) for (d, m, s) in dir_ages if d.exists()
+            ]
+            survivors.sort(key=lambda t: t[1])
+            for job_dir, _, size in survivors:
+                if self.get_disk_usage() <= 70.0:
+                    break
+                try:
+                    shutil.rmtree(job_dir)
+                    removed_count += 1
+                    removed_bytes += size
+                    logger.warning(
+                        f"⚠️ Pressure-evicted job: {job_dir.name} "
+                        f"({size / 1024 / 1024:.2f} MB)"
+                    )
+                except Exception as e:
+                    logger.error(f"Pressure cleanup failed on {job_dir.name}: {e}")
+
         if removed_count > 0:
-            logger.info(f"Cleanup complete: {removed_count} jobs, {removed_bytes / 1024 / 1024:.2f} MB freed")
+            logger.info(
+                f"Cleanup complete: {removed_count} jobs, "
+                f"{removed_bytes / 1024 / 1024:.2f} MB freed"
+            )
 
     def get_disk_usage(self) -> float:
         """Get disk usage percentage"""
