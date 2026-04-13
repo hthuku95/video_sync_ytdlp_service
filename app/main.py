@@ -140,6 +140,13 @@ async def download_video(
         if error or not file_path:
             stats["failed_downloads"] += 1
             logger.error(f"❌ Download failed: {error.message if error else 'Unknown error'}")
+            # Free any partial files written before the failure — otherwise
+            # repeated failed downloads on the same job_id (or across job_ids)
+            # accumulate `.part` / `.ytdl` files and fill the disk.
+            try:
+                storage.delete_job_files(job_id)
+            except Exception as cleanup_err:
+                logger.warning(f"post-failure cleanup error for {job_id}: {cleanup_err}")
             return JSONResponse(
                 status_code=500 if error.is_transient else 400,
                 content=ErrorResponse(error=error).model_dump()
@@ -189,6 +196,11 @@ async def download_video(
     except Exception as e:
         stats["failed_downloads"] += 1
         logger.exception(f"💥 Unexpected error during download: {e}")
+        # Same cleanup obligation as the structured-failure branch above.
+        try:
+            storage.delete_job_files(job_id)
+        except Exception as cleanup_err:
+            logger.warning(f"post-exception cleanup error for {job_id}: {cleanup_err}")
         error = ErrorDetail(
             code=ErrorCode.SERVER_ERROR,
             message=f"Internal server error: {str(e)}",
