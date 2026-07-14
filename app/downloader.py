@@ -59,6 +59,7 @@ Environment variables:
 import asyncio
 import base64
 import os
+import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import logging
@@ -146,11 +147,16 @@ class YouTubeDownloader:
         self.po_token: Optional[str] = os.getenv('YTDLP_PO_TOKEN')
         self.visitor_data: Optional[str] = os.getenv('YTDLP_VISITOR_DATA')
         self.cobalt_api_token: Optional[str] = os.getenv('COBALT_API_TOKEN')
-        # YTDLP_PROXY env var takes priority; Webshare proxy fills in if not explicitly set
-        self.proxy: Optional[str] = os.getenv('YTDLP_PROXY') or proxy_manager.get_proxy_url()
+        # Keep an explicit proxy only as a fallback. Prefer the Webshare pool when present so
+        # requests can rotate and avoid being pinned to a dead or unpaid gateway endpoint.
+        self.explicit_proxy: Optional[str] = os.getenv('YTDLP_PROXY')
         self._setup_cookies()
-        if self.proxy:
-            logger.info(f"✅ Residential proxy configured: {self.proxy.split('@')[-1] if '@' in self.proxy else self.proxy}")
+        initial_proxy = self._get_effective_proxy()
+        if initial_proxy:
+            logger.info(
+                f"✅ Residential proxy configured: "
+                f"{initial_proxy.split('@')[-1] if '@' in initial_proxy else initial_proxy}"
+            )
 
     # =========================================================================
     # SETUP HELPERS
@@ -174,6 +180,16 @@ class YouTubeDownloader:
             logger.info("✅ YouTube cookies loaded successfully")
         except Exception as e:
             logger.error(f"❌ Failed to load YouTube cookies: {e}")
+
+    def _get_effective_proxy(self) -> Optional[str]:
+        """
+        Resolve the proxy to use for the next request.
+
+        Prefer the Webshare rotating pool when available. Fall back to the static
+        YTDLP_PROXY env var only if no pool proxy can be obtained.
+        """
+        rotated_proxy = proxy_manager.get_proxy_url()
+        return rotated_proxy or self.explicit_proxy
 
     def _build_ytdlp_opts(
         self,
@@ -236,7 +252,7 @@ class YouTubeDownloader:
         # Apply proxy only if use_proxy=True (android/ios work without proxy from datacenter IPs,
         # so those strategies intentionally pass use_proxy=False for the no-proxy-first attempt).
         if use_proxy:
-            effective_proxy = self.proxy or proxy_manager.get_proxy_url()
+            effective_proxy = self._get_effective_proxy()
             if effective_proxy:
                 opts['proxy'] = effective_proxy
 
@@ -362,6 +378,449 @@ class YouTubeDownloader:
             is_live=info.get("is_live", False),
             is_private=False,
         )
+
+    # =========================================================================
+    # R2 STREAMING (DIRECT TO CLOUD STORAGE, NO LOCAL DISK)
+    # =========================================================================
+
+    @staticmethod
+    def _get_r2_client():
+        """Create a boto3 S3 client configured for Cloudflare R2."""
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        endpoint = os.environ.get('R2_ENDPOINT', '')
+        access_key = os.environ.get('R2_ACCESS_KEY_ID', '')
+        secret_key = os.environ.get('R2_SECRET_ACCESS_KEY', '')
+        if not endpoint or not access_key or not secret_key:
+            raise ValueError("R2 credentials not configured (R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)")
+        return boto3.client(
+            's3',
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            config=BotoConfig(signature_version='s3v4'),
+            region_name='auto',
+        )
+
+    async def _stream_to_r2(self, r2_key: str, r2_bucket: str, chunk_generator) -> str:
+        """Multipart upload a stream of byte chunks to R2. Returns presigned GET URL."""
+        s3 = self._get_r2_client()
+
+        # Initiate multipart upload
+        mpu = await asyncio.to_thread(
+            s3.create_multipart_upload, Bucket=r2_bucket, Key=r2_key
+        )
+        upload_id = mpu['UploadId']
+        parts: List[Dict[str, Any]] = []
+        part_number = 1
+        PART_SIZE = 50 * 1024 * 1024  # 50 MB
+
+        try:
+            buf = bytearray()
+            for chunk in chunk_generator:
+                buf.extend(chunk)
+                while len(buf) >= PART_SIZE:
+                    part_data = bytes(buf[:PART_SIZE])
+                    del buf[:PART_SIZE]
+                    part = await asyncio.to_thread(
+                        s3.upload_part,
+                        Bucket=r2_bucket, Key=r2_key,
+                        UploadId=upload_id, PartNumber=part_number,
+                        Body=part_data,
+                    )
+                    parts.append({'PartNumber': part_number, 'ETag': part['ETag']})
+                    part_number += 1
+
+            # Upload final partial part
+            if buf:
+                part = await asyncio.to_thread(
+                    s3.upload_part,
+                    Bucket=r2_bucket, Key=r2_key,
+                    UploadId=upload_id, PartNumber=part_number,
+                    Body=bytes(buf),
+                )
+                parts.append({'PartNumber': part_number, 'ETag': part['ETag']})
+
+            # Complete multipart upload
+            await asyncio.to_thread(
+                s3.complete_multipart_upload,
+                Bucket=r2_bucket, Key=r2_key,
+                UploadId=upload_id,
+                MultipartUpload={'Parts': parts},
+            )
+        except Exception:
+            # Abort on failure
+            try:
+                await asyncio.to_thread(
+                    s3.abort_multipart_upload,
+                    Bucket=r2_bucket, Key=r2_key, UploadId=upload_id,
+                )
+            except Exception:
+                pass
+            raise
+
+        # Generate presigned GET URL (7 day expiry)
+        presigned = await asyncio.to_thread(
+            s3.generate_presigned_url,
+            'get_object',
+            Params={'Bucket': r2_bucket, 'Key': r2_key},
+            ExpiresIn=7 * 24 * 3600,
+        )
+        return presigned
+
+    async def _run_ytdlp_r2_stream(
+        self,
+        video_url: str,
+        r2_key: str,
+        r2_bucket: str,
+        player_clients: List[str],
+        use_cookies: bool = False,
+        use_proxy: bool = True,
+    ) -> tuple[Optional[str], Optional[VideoMetadata], Optional[str]]:
+        """
+        Download via yt-dlp subprocess with `-o -` (stdout), streaming directly to R2.
+        Zero local disk — pipes yt-dlp's binary output straight to R2 multipart upload.
+        """
+        cmd = ['yt-dlp',
+               '--format', 'best[ext=mp4]/best',
+               '-o', '-',
+               '--no-playlist',
+               '--user-agent',
+               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+               '--no-check-certificates',
+               '--quiet',
+               '--no-warnings',
+        ]
+        if self.po_token and self.visitor_data:
+            cmd.extend(['--extractor-args', f'youtube:po_token=web+{self.po_token};visitor_data={self.visitor_data}'])
+        if use_proxy:
+            proxy = self._get_effective_proxy()
+            if proxy:
+                cmd.extend(['--proxy', proxy])
+
+        # Extract metadata first
+        meta_opts = self._build_ytdlp_opts(
+            player_clients=player_clients,
+            use_cookies=use_cookies,
+            skip_webpage=True,
+            use_proxy=use_proxy,
+        )
+        meta_opts['skip_download'] = True
+
+        logger.info(f"📋 R2 stream: extracting metadata via {player_clients}")
+        try:
+            info = await asyncio.to_thread(
+                lambda: yt_dlp.YoutubeDL(meta_opts).extract_info(video_url, download=False)
+            )
+        except Exception as e:
+            return None, None, f"yt-dlp metadata extraction failed: {e}"
+
+        if not info:
+            return None, None, "yt-dlp returned no metadata"
+
+        metadata = self._extract_metadata_from_ytdlp(info)
+
+        # Get title from info for the format selector label
+        title = info.get('title', 'Unknown')
+        logger.info(f"📥 R2 stream: downloading '{title}' via yt-dlp subprocess → R2 ({r2_key})")
+
+        # Spawn yt-dlp with stdout pipe
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        async def chunk_generator():
+            """Yield chunks from yt-dlp's stdout."""
+            assert process.stdout is not None
+            while True:
+                chunk = await process.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
+        try:
+            r2_url = await self._stream_to_r2(r2_key, r2_bucket, chunk_generator())
+        except Exception as e:
+            # Kill yt-dlp process on failure
+            try:
+                process.kill()
+            except Exception:
+                pass
+            return None, None, f"R2 streaming failed: {e}"
+
+        # Wait for yt-dlp to finish and check for errors
+        returncode = await process.wait()
+        if returncode != 0:
+            stderr = (await process.stderr.read()).decode('utf-8', errors='replace') if process.stderr else ''
+            logger.warning(f"⚠️ yt-dlp exit code {returncode}: {stderr[:200]}")
+            # If the download partially succeeded (R2 got data), still return the URL
+            # The presigned URL is valid, caller can use whatever we got
+
+        metadata.file_size_bytes = None  # unknown when streaming
+        logger.info(f"✅ R2 stream complete: {r2_url}")
+        return r2_url, metadata, None
+
+    async def _run_httpx_r2_stream(
+        self,
+        stream_url: str,
+        r2_key: str,
+        r2_bucket: str,
+        metadata: VideoMetadata,
+        proxy: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[VideoMetadata], Optional[str]]:
+        """
+        Stream an HTTP response (from a proxy/CDN URL) directly to R2.
+        Used by cobalt/invidious/piped strategies in R2 mode.
+        """
+        import httpx
+
+        logger.info(f"📥 HTTPX R2 stream: {stream_url[:80]}... → R2 ({r2_key})")
+
+        client_kwargs = {"timeout": 300, "follow_redirects": True}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        try:
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                async with client.stream("GET", stream_url) as resp:
+                    if resp.status_code not in (200, 206):
+                        return None, None, f"HTTP {resp.status_code} from {stream_url[:80]}"
+
+                    async def chunk_generator():
+                        async for chunk in resp.aiter_bytes(65536):
+                            yield chunk
+
+                    r2_url = await self._stream_to_r2(r2_key, r2_bucket, chunk_generator())
+        except Exception as e:
+            return None, None, f"HTTPX R2 stream failed: {e}"
+
+        metadata.file_size_bytes = None
+        logger.info(f"✅ HTTPX R2 stream complete: {r2_url}")
+        return r2_url, metadata, None
+
+    async def _get_cobalt_stream_url(
+        self,
+        video_url: str,
+        quality: str,
+        api_url: str,
+    ) -> tuple[Optional[str], Optional[VideoMetadata], Optional[str]]:
+        """Extract a direct stream URL from cobalt.tools API without downloading.
+        Returns (stream_url, metadata, error) for use with _run_httpx_r2_stream."""
+        cobalt_quality = {
+            "360p": "360", "480p": "480", "720p": "720", "1080p": "1080", "best": "max"
+        }.get(quality, "720")
+        import httpx
+
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self.cobalt_api_token:
+            headers["Authorization"] = f"Api-Key {self.cobalt_api_token}"
+
+        cobalt_proxy = proxy_manager.get_proxy_url()
+        try:
+            resp = await asyncio.to_thread(
+                lambda: httpx.post(
+                    api_url,
+                    json={"url": video_url, "videoQuality": cobalt_quality, "downloadMode": "auto"},
+                    headers=headers,
+                    timeout=30,
+                    follow_redirects=True,
+                    **({"proxy": cobalt_proxy} if cobalt_proxy else {}),
+                )
+            )
+        except Exception as e:
+            return None, None, f"cobalt API request failed: {e}"
+
+        if resp.status_code != 200:
+            return None, None, f"cobalt API HTTP {resp.status_code}: {resp.text[:200]}"
+
+        try:
+            data = resp.json()
+        except Exception:
+            return None, None, f"cobalt invalid JSON: {resp.text[:200]}"
+
+        status = data.get("status", "")
+        if status == "error":
+            err = data.get("error", {})
+            code = err.get("code", str(err)) if isinstance(err, dict) else str(err)
+            return None, None, f"cobalt error: {code}"
+
+        if status not in ("stream", "redirect", "tunnel", "picker"):
+            return None, None, f"cobalt unexpected status '{status}': {str(data)[:200]}"
+
+        if status == "picker":
+            items = data.get("picker", [])
+            if not items:
+                return None, None, "cobalt picker returned no items"
+            stream_url = items[0].get("url")
+        else:
+            stream_url = data.get("url")
+
+        if not stream_url:
+            return None, None, "cobalt returned no stream URL"
+
+        metadata = VideoMetadata(
+            title="Unknown",
+            duration_seconds=0.0,
+            file_size_bytes=None,
+            format="mp4",
+        )
+        return stream_url, metadata, None
+
+    async def _get_invidious_stream_url(
+        self,
+        video_url: str,
+        quality: str,
+        instance: str,
+    ) -> tuple[Optional[str], Optional[VideoMetadata], Optional[str]]:
+        """Extract a proxied stream URL from an Invidious instance without downloading.
+        Returns (stream_url, metadata, error) for use with _run_httpx_r2_stream."""
+        import re
+        import httpx
+
+        vid_match = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", video_url)
+        if not vid_match:
+            return None, None, f"cannot extract video ID from URL: {video_url}"
+        video_id = vid_match.group(1)
+        max_height = QUALITY_TO_HEIGHT.get(quality, 720)
+
+        invidious_proxy = proxy_manager.get_proxy_url()
+        try:
+            resp = await asyncio.to_thread(
+                lambda: httpx.get(
+                    f"{instance}/api/v1/videos/{video_id}",
+                    params={"local": "true"},
+                    timeout=30,
+                    **({"proxy": invidious_proxy} if invidious_proxy else {}),
+                )
+            )
+        except Exception as e:
+            return None, None, f"Invidious API request failed: {e}"
+
+        if resp.status_code != 200:
+            return None, None, f"Invidious API HTTP {resp.status_code}"
+
+        try:
+            data = resp.json()
+        except Exception:
+            return None, None, "Invidious invalid JSON response"
+
+        if "error" in data:
+            return None, None, f"Invidious error: {data['error']}"
+
+        format_streams = data.get("formatStreams", [])
+        if not format_streams:
+            return None, None, "Invidious: no format streams available"
+
+        best_stream = None
+        best_height = 0
+        for stream in format_streams:
+            res = stream.get("resolution", "0x0")
+            try:
+                h = int(res.split("x")[1]) if "x" in res else int(res.rstrip("p"))
+                if h <= max_height and h > best_height:
+                    best_height = h
+                    best_stream = stream
+            except (ValueError, IndexError):
+                pass
+
+        if best_stream is None:
+            best_stream = format_streams[-1]
+
+        stream_url = best_stream.get("url")
+        if not stream_url:
+            return None, None, "Invidious: stream has no URL"
+
+        metadata = VideoMetadata(
+            title=data.get("title", "Unknown"),
+            duration_seconds=float(data.get("lengthSeconds") or 0),
+            file_size_bytes=None,
+            format="mp4",
+            video_id=video_id,
+            view_count=int(data["viewCount"]) if data.get("viewCount") else None,
+            is_live=False,
+            is_private=False,
+        )
+        return stream_url, metadata, None
+
+    async def _get_piped_stream_url(
+        self,
+        video_url: str,
+        quality: str,
+        instance: str,
+    ) -> tuple[Optional[str], Optional[VideoMetadata], Optional[str]]:
+        """Extract a proxied stream URL from a Piped instance without downloading.
+        Returns (stream_url, metadata, error) for use with _run_httpx_r2_stream."""
+        import re
+        import httpx
+
+        vid_match = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", video_url)
+        if not vid_match:
+            return None, None, f"cannot extract video ID from URL: {video_url}"
+        video_id = vid_match.group(1)
+        max_height = QUALITY_TO_HEIGHT.get(quality, 720)
+
+        piped_proxy = proxy_manager.get_proxy_url()
+        try:
+            resp = await asyncio.to_thread(
+                lambda: httpx.get(
+                    f"{instance}/streams/{video_id}",
+                    timeout=30,
+                    follow_redirects=True,
+                    headers={"Accept": "application/json"},
+                    **({"proxy": piped_proxy} if piped_proxy else {}),
+                )
+            )
+        except Exception as e:
+            return None, None, f"Piped API request failed: {e}"
+
+        if resp.status_code != 200:
+            return None, None, f"Piped API HTTP {resp.status_code}"
+
+        try:
+            data = resp.json()
+        except Exception:
+            return None, None, "Piped invalid JSON response"
+
+        if "error" in data:
+            return None, None, f"Piped error: {data['error']}"
+
+        video_streams = data.get("videoStreams", [])
+        if not video_streams:
+            return None, None, "Piped: no videoStreams in response"
+
+        progressive = [s for s in video_streams if not s.get("videoOnly", True)]
+        if not progressive:
+            progressive = video_streams
+
+        best_stream = None
+        best_height = 0
+        for stream in progressive:
+            h = stream.get("height", 0) or 0
+            if h <= max_height and h > best_height:
+                best_height = h
+                best_stream = stream
+
+        if best_stream is None:
+            best_stream = progressive[0]
+
+        stream_url = best_stream.get("url")
+        if not stream_url:
+            return None, None, "Piped: stream entry has no URL"
+
+        metadata = VideoMetadata(
+            title=data.get("title", "Unknown"),
+            duration_seconds=float(data.get("duration") or 0),
+            file_size_bytes=None,
+            format="mp4",
+            video_id=video_id,
+            view_count=int(data["views"]) if data.get("views") else None,
+            is_live=False,
+            is_private=False,
+        )
+        return stream_url, metadata, None
 
     # =========================================================================
     # INDIVIDUAL STRATEGY IMPLEMENTATIONS
@@ -1146,40 +1605,59 @@ class YouTubeDownloader:
 
     async def get_info(self, video_url: str) -> tuple[Optional[VideoMetadata], Optional[ErrorDetail]]:
         """Get video metadata without downloading."""
-        opts = self._build_ytdlp_opts(
-            player_clients=['ios', 'tv_embedded', 'mweb'],
-            use_cookies=bool(self.cookies_file),
-            skip_webpage=not bool(self.cookies_file),
-        )
-        opts['skip_download'] = True
-
-        def _extract():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(video_url, download=False)
-
+        has_cookies = bool(self.cookies_file)
+        strategies = self._build_strategy_list(has_cookies=has_cookies)
         loop = asyncio.get_event_loop()
-        try:
-            info = await loop.run_in_executor(None, _extract)
-        except yt_dlp.utils.DownloadError as e:
-            logger.error(f"yt-dlp info extraction failed: {e}")
-            return None, self._classify_error(str(e))
-        except Exception as e:
-            logger.error(f"Unexpected error during info extraction: {e}")
-            return None, ErrorDetail(
-                code=ErrorCode.SERVER_ERROR,
-                message=f"Unexpected error: {str(e)}",
-                is_transient=True,
-                retry_after_seconds=120,
-            )
+        last_error: Optional[ErrorDetail] = None
 
-        if not info:
-            return None, ErrorDetail(
-                code=ErrorCode.VIDEO_UNAVAILABLE,
-                message="Could not extract video info",
-                is_transient=False,
-            )
+        for idx, (name, kind, kwargs) in enumerate(strategies, 1):
+            # Metadata-only requests only need extractor strategies that can return structured
+            # info immediately. Skip full download-only fallbacks such as cobalt/invidious/piped.
+            if kind != "ytdlp":
+                continue
 
-        return self._extract_metadata_from_ytdlp(info), None
+            logger.info(f"ℹ️ Info strategy {idx}/{len(strategies)}: {name}")
+            opts = self._build_ytdlp_opts(
+                player_clients=kwargs["player_clients"],
+                use_cookies=kwargs["use_cookies"],
+                skip_webpage=kwargs["skip_webpage"],
+                use_proxy=kwargs.get("use_proxy", True),
+            )
+            opts['skip_download'] = True
+
+            def _extract():
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(video_url, download=False)
+
+            try:
+                info = await loop.run_in_executor(None, _extract)
+            except yt_dlp.utils.DownloadError as e:
+                logger.warning(f"⚠️ Info strategy failed ({name}): {e}")
+                last_error = self._classify_error(str(e))
+                if self._is_permanent_error(last_error):
+                    return None, last_error
+                continue
+            except Exception as e:
+                logger.warning(f"⚠️ Unexpected info strategy failure ({name}): {e}")
+                last_error = ErrorDetail(
+                    code=ErrorCode.SERVER_ERROR,
+                    message=f"Unexpected error: {str(e)}",
+                    is_transient=True,
+                    retry_after_seconds=120,
+                )
+                continue
+
+            if info:
+                return self._extract_metadata_from_ytdlp(info), None
+
+        if last_error:
+            return None, last_error
+
+        return None, ErrorDetail(
+            code=ErrorCode.VIDEO_UNAVAILABLE,
+            message="Could not extract video info with available strategies",
+            is_transient=False,
+        )
 
 
     def _build_strategy_list(self, has_cookies: bool = True):
@@ -1200,7 +1678,7 @@ class YouTubeDownloader:
 
         # --- Proxy-first strategies (tried after no-proxy fast-path fails) ---
         # Residential proxies bypass YouTube's datacenter IP blocking for clients that need it.
-        if self.proxy:
+        if self._get_effective_proxy():
             # android+proxy — android client through residential proxy
             strategies.append(("yt-dlp android+proxy", "ytdlp", {
                 "player_clients": ["android"], "use_cookies": False, "skip_webpage": True, "use_proxy": True
@@ -1345,130 +1823,219 @@ class YouTubeDownloader:
         output_format: str = "mp4",
         timeout_seconds: int = 3600,
         only_strategy: Optional[int] = None,
-    ) -> tuple[Optional[Path], Optional[VideoMetadata], Optional[ErrorDetail]]:
+        r2_key: Optional[str] = None,
+        r2_bucket: Optional[str] = None,
+    ) -> tuple[Optional[Path], Optional[str], Optional[VideoMetadata], Optional[ErrorDetail]]:
         """
         Download a YouTube video using up to 16 strategies with automatic fallback.
 
-        Returns (file_path, metadata, None) on success.
-        Returns (None, None, error) if all strategies fail.
+        When r2_key is set, streams directly to R2 (zero local disk). Returns
+        (None, r2_url, metadata, None) on success.
+
+        When r2_key is None, writes to local disk (legacy). Returns
+        (file_path, None, metadata, None) on success.
+
+        Returns (None, None, None, error) if all strategies fail.
         """
-        job_dir = storage.get_job_dir(job_id)
-        output_path = job_dir / f"video.{output_format}"
-        format_selector = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
-
-        has_cookies = bool(self.cookies_file)
-        strategies = self._build_strategy_list(has_cookies=has_cookies)
-
-        total = len(strategies)
-
-        # If caller requested a specific strategy, filter to just that one (1-based index)
-        if only_strategy is not None:
-            if 1 <= only_strategy <= total:
-                strategies = [strategies[only_strategy - 1]]
-                logger.info(f"🎯 Running only strategy {only_strategy}/{total}: {strategies[0][0]}")
-            else:
-                logger.warning(f"⚠️ only_strategy={only_strategy} out of range (1-{total}), running all")
-        else:
-            logger.info(f"🚀 Starting download with {total} strategies: {video_url}")
-
         last_error: Optional[ErrorDetail] = None
         all_errors: List[str] = []
 
-        for idx, (name, kind, kwargs) in enumerate(strategies, 1):
-            logger.info(f"🎯 Strategy {idx}/{total}: {name}")
+        if r2_key:
+            # ── R2 streaming mode (zero local disk) ──
+            r2_bucket = r2_bucket or os.environ.get('R2_BUCKET', 'video-editor')
+            has_cookies = bool(self.cookies_file)
+            strategies = self._build_strategy_list(has_cookies=has_cookies)
+            total = len(strategies)
 
-            # Clean up any partial files from previous attempt
-            for leftover in job_dir.glob("video.*"):
+            logger.info(f"🚀 Starting R2 stream download with {total} strategies: {video_url}")
+
+            for idx, (name, kind, kwargs) in enumerate(strategies, 1):
+                logger.info(f"🎯 R2 strategy {idx}/{total}: {name}")
+
+                r2_url: Optional[str] = None
+                metadata: Optional[VideoMetadata] = None
+                error_msg: Optional[str] = None
+
                 try:
-                    leftover.unlink()
-                except Exception:
-                    pass
+                    if kind == "ytdlp":
+                        # Use subprocess -o - stdout pipe → R2
+                        r2_url, metadata, error_msg = await self._run_ytdlp_r2_stream(
+                            video_url, r2_key, r2_bucket,
+                            player_clients=kwargs["player_clients"],
+                            use_cookies=kwargs["use_cookies"],
+                            use_proxy=kwargs.get("use_proxy", True),
+                        )
+                    elif kind == "cobalt":
+                        # Get stream URL from cobalt, pipe to R2
+                        stream_url, meta, err = await self._get_cobalt_stream_url(
+                            video_url, quality, kwargs["api_url"]
+                        )
+                        if err:
+                            error_msg = err
+                        elif stream_url:
+                            r2_url, metadata, error_msg = await self._run_httpx_r2_stream(
+                                stream_url, r2_key, r2_bucket, meta,
+                            )
+                    elif kind == "invidious":
+                        stream_url, meta, err = await self._get_invidious_stream_url(
+                            video_url, quality, kwargs["instance"]
+                        )
+                        if err:
+                            error_msg = err
+                        elif stream_url:
+                            r2_url, metadata, error_msg = await self._run_httpx_r2_stream(
+                                stream_url, r2_key, r2_bucket, meta,
+                            )
+                    elif kind == "piped":
+                        stream_url, meta, err = await self._get_piped_stream_url(
+                            video_url, quality, kwargs["instance"]
+                        )
+                        if err:
+                            error_msg = err
+                        elif stream_url:
+                            r2_url, metadata, error_msg = await self._run_httpx_r2_stream(
+                                stream_url, r2_key, r2_bucket, meta,
+                            )
+                    else:
+                        # Skip strategies that can't stream (pytubefix, you_get, streamlink, nodriver, playwright)
+                        error_msg = f"skipped (cannot stream to R2)"
+                except Exception as e:
+                    error_msg = f"Unexpected exception: {e}"
 
-            file_path: Optional[Path] = None
-            metadata: Optional[VideoMetadata] = None
-            error_msg: Optional[str] = None
+                if r2_url:
+                    logger.info(f"✅ R2 strategy {idx}/{total} ({name}) succeeded: {r2_url[:80]}...")
+                    return None, r2_url, metadata, None
 
-            try:
-                if kind == "ytdlp":
-                    file_path, metadata, error_msg = await self._run_ytdlp_strategy(
-                        video_url, output_path, format_selector,
-                        player_clients=kwargs["player_clients"],
-                        use_cookies=kwargs["use_cookies"],
-                        skip_webpage=kwargs["skip_webpage"],
-                        use_proxy=kwargs.get("use_proxy", True),
-                    )
-                elif kind == "cobalt":
-                    file_path, metadata, error_msg = await self._run_cobalt_strategy(
-                        video_url, job_dir, quality,
-                        api_url=kwargs["api_url"],
-                    )
-                elif kind == "invidious":
-                    file_path, metadata, error_msg = await self._run_invidious_strategy(
-                        video_url, job_dir, quality,
-                        instance=kwargs["instance"],
-                    )
-                elif kind == "piped":
-                    file_path, metadata, error_msg = await self._run_piped_strategy(
-                        video_url, job_dir, quality,
-                        instance=kwargs["instance"],
-                    )
-                elif kind == "pytubefix":
-                    file_path, metadata, error_msg = await self._run_pytubefix_strategy(
-                        video_url, job_dir, quality,
-                        client_name=kwargs["client_name"],
-                    )
-                elif kind == "you_get":
-                    file_path, metadata, error_msg = await self._run_you_get_strategy(
-                        video_url, job_dir,
-                    )
-                elif kind == "nodriver":
-                    file_path, metadata, error_msg = await self._run_nodriver_strategy(
-                        video_url, job_dir, quality,
-                    )
-                elif kind == "playwright_gemini":
-                    agent = YouTubePlaywrightAgent()
-                    file_path, metadata, error_msg = await agent.download(
-                        video_url, job_dir, quality
-                    )
-                elif kind == "streamlink":
-                    file_path, metadata, error_msg = await self._run_streamlink_strategy(
-                        video_url, job_dir,
-                    )
-            except Exception as e:
-                error_msg = f"Unexpected exception in strategy: {e}"
+                error_summary = error_msg or "unknown error"
+                logger.warning(f"⚠️ R2 strategy {idx}/{total} ({name}) failed: {error_summary[:120]}")
+                all_errors.append(f"[{name}]: {error_summary[:200]}")
 
-            # Check for success
-            if file_path and file_path.exists() and file_path.stat().st_size > 0:
-                size_mb = file_path.stat().st_size / 1024 / 1024
-                logger.info(f"✅ Strategy {idx}/{total} ({name}) succeeded! {file_path.name} ({size_mb:.1f} MB)")
-                return file_path, metadata, None
+                if error_msg:
+                    classified = self._classify_error(error_msg)
+                    last_error = classified
+                    if self._is_permanent_error(classified):
+                        break
 
-            # Strategy failed
-            error_summary = error_msg or "unknown error"
-            logger.warning(f"⚠️ Strategy {idx}/{total} ({name}) failed: {error_summary[:120]}")
-            all_errors.append(f"[{name}]: {error_summary[:200]}")
+            logger.error(f"❌ All {total} R2 strategies failed for {video_url}")
+            if last_error:
+                last_error.details = {"all_strategy_errors": all_errors}
+                return None, None, None, last_error
+            return None, None, None, ErrorDetail(
+                code=ErrorCode.SERVER_ERROR,
+                message=f"All {total} R2 streaming strategies failed",
+                is_transient=True,
+                retry_after_seconds=300,
+                details={"all_strategy_errors": all_errors},
+            )
+        else:
+            # ── Legacy file-based download mode ──
+            job_dir = storage.get_job_dir(job_id)
+            output_path = job_dir / f"video.{output_format}"
+            format_selector = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
 
-            if error_msg:
-                classified = self._classify_error(error_msg)
-                last_error = classified
-                if self._is_permanent_error(classified):
-                    logger.error(f"❌ Permanent error — stopping all strategies: {error_summary[:120]}")
-                    break
+            has_cookies = bool(self.cookies_file)
+            strategies = self._build_strategy_list(has_cookies=has_cookies)
 
-        # All strategies exhausted
-        logger.error(f"❌ All {total} strategies failed for {video_url}")
+            total = len(strategies)
 
-        if last_error:
-            last_error.details = {"all_strategy_errors": all_errors}
-            return None, None, last_error
+            if only_strategy is not None:
+                if 1 <= only_strategy <= total:
+                    strategies = [strategies[only_strategy - 1]]
+                    logger.info(f"🎯 Running only strategy {only_strategy}/{total}: {strategies[0][0]}")
+                else:
+                    logger.warning(f"⚠️ only_strategy={only_strategy} out of range (1-{total}), running all")
+            else:
+                logger.info(f"🚀 Starting file download with {total} strategies: {video_url}")
 
-        return None, None, ErrorDetail(
-            code=ErrorCode.SERVER_ERROR,
-            message=f"All {total} download strategies failed",
-            is_transient=True,
-            retry_after_seconds=300,
-            details={"all_strategy_errors": all_errors},
-        )
+            for idx, (name, kind, kwargs) in enumerate(strategies, 1):
+                logger.info(f"🎯 Strategy {idx}/{total}: {name}")
+
+                for leftover in job_dir.glob("video.*"):
+                    try:
+                        leftover.unlink()
+                    except Exception:
+                        pass
+
+                file_path: Optional[Path] = None
+                metadata: Optional[VideoMetadata] = None
+                error_msg: Optional[str] = None
+
+                try:
+                    if kind == "ytdlp":
+                        file_path, metadata, error_msg = await self._run_ytdlp_strategy(
+                            video_url, output_path, format_selector,
+                            player_clients=kwargs["player_clients"],
+                            use_cookies=kwargs["use_cookies"],
+                            skip_webpage=kwargs["skip_webpage"],
+                            use_proxy=kwargs.get("use_proxy", True),
+                        )
+                    elif kind == "cobalt":
+                        file_path, metadata, error_msg = await self._run_cobalt_strategy(
+                            video_url, job_dir, quality,
+                            api_url=kwargs["api_url"],
+                        )
+                    elif kind == "invidious":
+                        file_path, metadata, error_msg = await self._run_invidious_strategy(
+                            video_url, job_dir, quality,
+                            instance=kwargs["instance"],
+                        )
+                    elif kind == "piped":
+                        file_path, metadata, error_msg = await self._run_piped_strategy(
+                            video_url, job_dir, quality,
+                            instance=kwargs["instance"],
+                        )
+                    elif kind == "pytubefix":
+                        file_path, metadata, error_msg = await self._run_pytubefix_strategy(
+                            video_url, job_dir, quality,
+                            client_name=kwargs["client_name"],
+                        )
+                    elif kind == "you_get":
+                        file_path, metadata, error_msg = await self._run_you_get_strategy(
+                            video_url, job_dir,
+                        )
+                    elif kind == "nodriver":
+                        file_path, metadata, error_msg = await self._run_nodriver_strategy(
+                            video_url, job_dir, quality,
+                        )
+                    elif kind == "playwright_gemini":
+                        agent = YouTubePlaywrightAgent()
+                        file_path, metadata, error_msg = await agent.download(
+                            video_url, job_dir, quality
+                        )
+                    elif kind == "streamlink":
+                        file_path, metadata, error_msg = await self._run_streamlink_strategy(
+                            video_url, job_dir,
+                        )
+                except Exception as e:
+                    error_msg = f"Unexpected exception in strategy: {e}"
+
+                if file_path and file_path.exists() and file_path.stat().st_size > 0:
+                    size_mb = file_path.stat().st_size / 1024 / 1024
+                    logger.info(f"✅ Strategy {idx}/{total} ({name}) succeeded! {file_path.name} ({size_mb:.1f} MB)")
+                    return file_path, None, metadata, None
+
+                error_summary = error_msg or "unknown error"
+                logger.warning(f"⚠️ Strategy {idx}/{total} ({name}) failed: {error_summary[:120]}")
+                all_errors.append(f"[{name}]: {error_summary[:200]}")
+
+                if error_msg:
+                    classified = self._classify_error(error_msg)
+                    last_error = classified
+                    if self._is_permanent_error(classified):
+                        logger.error(f"❌ Permanent error — stopping all strategies: {error_summary[:120]}")
+                        break
+
+            logger.error(f"❌ All {total} strategies failed for {video_url}")
+            if last_error:
+                last_error.details = {"all_strategy_errors": all_errors}
+                return None, None, None, last_error
+            return None, None, None, ErrorDetail(
+                code=ErrorCode.SERVER_ERROR,
+                message=f"All {total} download strategies failed",
+                is_transient=True,
+                retry_after_seconds=300,
+                details={"all_strategy_errors": all_errors},
+            )
 
 
 # Global singleton

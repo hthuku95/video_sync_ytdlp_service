@@ -28,6 +28,8 @@ class DownloadRequest(BaseModel):
     prefer_base64: Optional[bool] = Field(False, description="Force base64 encoding instead of URL")
     timeout_seconds: Optional[int] = Field(3600, description="Download timeout in seconds")
     only_strategy: Optional[int] = Field(None, description="Run only this strategy number (1-based). Use GET /api/v1/strategies to list available strategies.")
+    r2_key: Optional[str] = Field(None, description="R2 storage key — if set, stream directly to R2 (zero local disk)")
+    r2_bucket: Optional[str] = Field(None, description="R2 bucket name (defaults to R2_BUCKET env var)")
 
     class Config:
         json_schema_extra = {
@@ -37,7 +39,8 @@ class DownloadRequest(BaseModel):
                 "quality": "720p",
                 "format": "mp4",
                 "prefer_base64": False,
-                "timeout_seconds": 3600
+                "timeout_seconds": 3600,
+                "r2_key": "downloads/session-abc123/source.mp4",
             }
         }
 
@@ -72,9 +75,10 @@ class ErrorDetail(BaseModel):
 class DownloadResponse(BaseModel):
     """Success response for /api/v1/download"""
     success: bool = True
-    method: str = Field(..., description="'url' or 'base64'")
+    method: str = Field(..., description="'url', 'base64', or 'r2'")
     download_url: Optional[str] = Field(None, description="URL to download file (method=url)")
     file_data: Optional[str] = Field(None, description="Base64-encoded file data (method=base64)")
+    r2_url: Optional[str] = Field(None, description="R2 presigned URL (method=r2)")
     expires_at: Optional[datetime] = Field(None, description="URL expiration time (method=url)")
     metadata: VideoMetadata
 

@@ -127,17 +127,19 @@ async def download_video(
     stats["active_downloads"] += 1
 
     try:
-        # Download video
-        file_path, metadata, error = await downloader.download(
+        # Download video (supports R2 streaming and legacy file-based modes)
+        file_path, r2_url, metadata, error = await downloader.download(
             video_url=request.video_url,
             job_id=job_id,
             quality=request.quality,
             output_format=request.format,
             timeout_seconds=request.timeout_seconds,
             only_strategy=request.only_strategy,
+            r2_key=request.r2_key,
+            r2_bucket=request.r2_bucket,
         )
 
-        if error or not file_path:
+        if error:
             stats["failed_downloads"] += 1
             logger.error(f"❌ Download failed: {error.message if error else 'Unknown error'}")
             # Free any partial files written before the failure — otherwise
@@ -154,7 +156,30 @@ async def download_video(
 
         stats["total_downloads"] += 1
 
-        # Determine response method
+        # R2 streaming mode — return presigned URL directly
+        if r2_url:
+            logger.info(f"✅ R2 stream complete: {r2_url[:80]}...")
+            return JSONResponse(
+                content=DownloadResponse(
+                    success=True,
+                    method="r2",
+                    r2_url=r2_url,
+                    metadata=metadata,
+                ).model_dump(mode='json')
+            )
+
+        # Legacy file-based mode
+        if not file_path:
+            stats["failed_downloads"] += 1
+            return JSONResponse(
+                status_code=500,
+                content=ErrorResponse(error=ErrorDetail(
+                    code=ErrorCode.SERVER_ERROR,
+                    message="No file returned from downloader",
+                    is_transient=True,
+                )).model_dump()
+            )
+
         file_size = file_path.stat().st_size
         max_base64_size = 50 * 1024 * 1024  # 50 MB
 
