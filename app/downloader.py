@@ -60,6 +60,7 @@ import asyncio
 import base64
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import logging
@@ -389,7 +390,7 @@ class YouTubeDownloader:
         import boto3
         from botocore.config import Config as BotoConfig
 
-        endpoint = os.environ.get('R2_ENDPOINT', '')
+        endpoint = os.environ.get('R2_ENDPOINT') or os.environ.get('R2_ENDPOINT_URL', '')
         access_key = os.environ.get('R2_ACCESS_KEY_ID', '')
         secret_key = os.environ.get('R2_SECRET_ACCESS_KEY', '')
         if not endpoint or not access_key or not secret_key:
@@ -418,7 +419,7 @@ class YouTubeDownloader:
 
         try:
             buf = bytearray()
-            for chunk in chunk_generator:
+            async for chunk in chunk_generator:
                 buf.extend(chunk)
                 while len(buf) >= PART_SIZE:
                     part_data = bytes(buf[:PART_SIZE])
@@ -429,7 +430,7 @@ class YouTubeDownloader:
                         UploadId=upload_id, PartNumber=part_number,
                         Body=part_data,
                     )
-                    parts.append({'PartNumber': part_number, 'ETag': part['ETag']})
+                    parts.append({'PartNumber': part_number, 'ETag': part['ETag'].strip('"')})
                     part_number += 1
 
             # Upload final partial part
@@ -440,7 +441,7 @@ class YouTubeDownloader:
                     UploadId=upload_id, PartNumber=part_number,
                     Body=bytes(buf),
                 )
-                parts.append({'PartNumber': part_number, 'ETag': part['ETag']})
+                parts.append({'PartNumber': part_number, 'ETag': part['ETag'].strip('"')})
 
             # Complete multipart upload
             await asyncio.to_thread(
@@ -482,7 +483,10 @@ class YouTubeDownloader:
         Download via yt-dlp subprocess with `-o -` (stdout), streaming directly to R2.
         Zero local disk — pipes yt-dlp's binary output straight to R2 multipart upload.
         """
-        cmd = ['yt-dlp',
+        # Use `python -m yt_dlp` (resolved via sys.executable) instead of the bare
+        # `yt-dlp` binary — the venv bin dir is not on systemd's PATH, so the bare
+        # name would raise FileNotFoundError ([Errno 2]).
+        cmd = [sys.executable, '-m', 'yt_dlp',
                '--format', 'best[ext=mp4]/best',
                '-o', '-',
                '--no-playlist',
@@ -492,12 +496,19 @@ class YouTubeDownloader:
                '--quiet',
                '--no-warnings',
         ]
+        # Match the player_client(s) used for metadata extraction, otherwise the
+        # stream download falls back to the web client and fails with
+        # "Requested format is not available".
+        client_args = ';'.join(player_clients)
+        extractor_args = f'youtube:player_client={client_args}'
         if self.po_token and self.visitor_data:
-            cmd.extend(['--extractor-args', f'youtube:po_token=web+{self.po_token};visitor_data={self.visitor_data}'])
+            extractor_args += f';po_token=web+{self.po_token};visitor_data={self.visitor_data}'
+        cmd.extend(['--extractor-args', extractor_args])
         if use_proxy:
             proxy = self._get_effective_proxy()
             if proxy:
                 cmd.extend(['--proxy', proxy])
+        cmd.append(video_url)
 
         # Extract metadata first
         meta_opts = self._build_ytdlp_opts(
