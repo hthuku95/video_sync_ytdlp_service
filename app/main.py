@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 
+from pydantic import BaseModel
 from .models import (
     DownloadRequest,
     DownloadResponse,
@@ -382,6 +383,134 @@ async def server_error_handler(request, exc):
             "is_transient": True,
         }
     )
+
+
+
+
+
+
+class ResolveRequest(BaseModel):
+    channel_url: str
+    count: int = 3
+
+
+@app.post("/api/v1/resolve")
+async def resolve_channel_vods(request: ResolveRequest):
+    """List the most recent COMPLETED VODs for a Kick channel.
+
+    Uses kick.com's v2 JSON API directly (works from datacenter IPs with a
+    browser UA — no BrowserBase/credits needed). Excludes live streams: a
+    live broadcast never completes and cannot be clipped."""
+    import asyncio
+    from urllib.parse import urlparse
+
+    # channel_url -> slug
+    path = urlparse(request.channel_url).path.strip("/")
+    slug = path.split("/")[0] if path else ""
+    slug = slug.removesuffix("/videos").removesuffix("/video")
+    if not slug:
+        raise HTTPException(status_code=400, detail=f"cannot parse slug from {request.channel_url}")
+
+    api = f"https://kick.com/api/v2/channels/{slug}/videos?sort_by=recorded_at&page=1"
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "curl", "-s", "-m", "30", api,
+                "-H", f"User-Agent: {ua}",
+                "-H", "Accept: application/json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=60,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="kick api fetch timed out")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"kick api request failed: {exc}")
+
+    import json as _json
+    try:
+        items = _json.loads(stdout.decode())
+        if isinstance(items, dict):
+            items = items.get("data", [])
+    except Exception:
+        items = []
+
+    vods = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or it.get("is_live"):
+            continue
+        vslug = it.get("slug") or ""
+        if not vslug:
+            continue
+        vods.append(f"https://kick.com/{slug}/videos/{vslug}")
+        if len(vods) >= max(1, min(request.count, 10)):
+            break
+
+    if not vods:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no completed VODs found for {slug} (page may be live-only or gated)",
+        )
+    return {"success": True, "urls": vods, "count": len(vods)}
+
+
+
+
+class ScrapFetchRequest(BaseModel):
+    url: str
+    impersonate: str = "chrome"
+    force_stealth: bool = False
+
+
+def _scrapling_fetch_sync(url: str, impersonate: str, force_stealth: bool):
+    """Blocking; runs in FastAPI's threadpool. Fast httpx fetch first; on
+    403/challenge (or when forced) retry with Camoufox stealth browser."""
+    from scrapling.fetchers import Fetcher, StealthyFetcher
+
+    if not force_stealth:
+        try:
+            page = Fetcher.get(url, impersonate=impersonate, stealthy_headers=True, timeout=60)
+            if page.status == 200:
+                return {"success": True, "status": 200, "mode": "fast", "html": page.html_content}
+            logger.warning(f"scrapling fast fetch status {page.status} for {url} — escalating to stealth")
+        except Exception as exc:
+            logger.warning(f"scrapling fast fetch failed for {url}: {exc} — escalating to stealth")
+
+    sp = StealthyFetcher.fetch(url, headless=True, solve_cloudflare=True, timeout=120000)
+    return {"success": sp.status == 200, "status": sp.status, "mode": "stealth", "html": sp.html_content}
+
+
+@app.post("/api/v1/fetch")
+async def scrapling_fetch(request: ScrapFetchRequest):
+    """BrowserBase-compatible raw-HTML fetch endpoint (self-hosted secondary).
+
+    BrowserBase credits exhausted (HTTP 402, Sep 3 2026) silently broke Kick
+    VOD resolution. This endpoint provides the same raw-HTML contract from
+    our own node: fast TLS-impersonated fetch, escalating to a stealth
+    Camoufox browser (Cloudflare Turnstile bypass) when challenged."""
+    import asyncio
+
+    def _validate(res):
+        if not res.get("success"):
+            raise HTTPException(status_code=502, detail=f"scrapling fetch returned {res.get('status')}")
+        return res
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, _validate, _scrapling_fetch_sync(request.url, request.impersonate, request.force_stealth)
+            ),
+            timeout=180,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="scrapling fetch timed out")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"scrapling fetch failed: {exc}")
 
 
 if __name__ == "__main__":
