@@ -2,6 +2,9 @@
 YouTube downloader using multiple strategies with automatic fallback.
 
 Strategy order (tried sequentially until one succeeds):
+  0K. kick VOD m3u8 (v2 API → HLS) — Kick VOD page URLs (kick.com/{slug}/videos/{id})
+      resolve the official HLS master.m3u8 via Kick's public v2 channel-videos JSON
+      and download it with the generic extractor; detours the 31 YouTube strategies
   NO-PROXY fast-path (always tried first — proven to work from Render datacenter IPs, Feb 2026):
   0a. yt-dlp android (no proxy)   — Android client WITHOUT proxy; fastest path; proven reliable
   0b. yt-dlp ios (no proxy)       — iOS client WITHOUT proxy; bypasses PO token
@@ -498,12 +501,16 @@ class YouTubeDownloader:
         ]
         # Match the player_client(s) used for metadata extraction, otherwise the
         # stream download falls back to the web client and fails with
-        # "Requested format is not available".
-        client_args = ';'.join(player_clients)
-        extractor_args = f'youtube:player_client={client_args}'
-        if self.po_token and self.visitor_data:
-            extractor_args += f';po_token=web+{self.po_token};visitor_data={self.visitor_data}'
-        cmd.extend(['--extractor-args', extractor_args])
+        # "Requested format is not available". NOTE: these youtube:-namespaced args
+        # only apply when yt-dlp actually uses the YouTube extractor; for non-YouTube
+        # URLs (e.g. a Kick HLS master.m3u8 resolved by the "kick" strategy) they
+        # are ignored by the generic extractor, so gate them on the URL.
+        if 'youtube.com' in video_url or 'youtu.be' in video_url:
+            client_args = ';'.join(player_clients)
+            extractor_args = f'youtube:player_client={client_args}'
+            if self.po_token and self.visitor_data:
+                extractor_args += f';po_token=web+{self.po_token};visitor_data={self.visitor_data}'
+            cmd.extend(['--extractor-args', extractor_args])
         if use_proxy:
             proxy = self._get_effective_proxy()
             if proxy:
@@ -1671,6 +1678,70 @@ class YouTubeDownloader:
         )
 
 
+    @staticmethod
+    def _parse_kick_vod(video_url: str):
+        """
+        Parse a `https://kick.com/{slug}/videos/{vslug}` VOD page URL.
+
+        Returns (slug, vslug) or None when the URL is not a Kick VOD page.
+        """
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(video_url)
+            if (p.hostname or '').endswith('kick.com'):
+                parts = p.path.strip('/').split('/')
+                if len(parts) == 3 and parts[1] == 'videos' and parts[0] and parts[2]:
+                    return parts[0], parts[2]
+        except Exception:
+            pass
+        return None
+
+    async def _resolve_kick_m3u8(self, video_url: str):
+        """
+        Resolve a Kick VOD page URL to its official HLS master.m3u8 URL.
+
+        Kick's public v2 endpoint
+        (https://kick.com/api/v2/channels/{slug}/videos?sort_by=recorded_at&page=1)
+        returns every VOD with its `source` field set to the master.m3u8 — no
+        browser, no Scrapling, no cookies; plain curl with a browser User-Agent.
+
+        Returns (m3u8_url, None) on success, else (None, error).
+        """
+        parsed = self._parse_kick_vod(video_url)
+        if not parsed:
+            return None, f"not a Kick VOD URL: {video_url[:120]}"
+        slug, vslug = parsed
+        api = f"https://kick.com/api/v2/channels/{slug}/videos?sort_by=recorded_at&page=1"
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'curl', '-s', '--max-time', '30',
+                api,
+                '-H', f'User-Agent: {ua}',
+                '-H', 'Accept: application/json',
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except Exception as e:
+            return None, f"kick v2 api request failed: {e}"
+
+        try:
+            import json
+            data = json.loads(stdout.decode('utf-8', errors='replace'))
+        except Exception as e:
+            return None, f"kick v2 api returned invalid JSON: {e}"
+
+        items = data if isinstance(data, list) else (data.get('data') or []) if isinstance(data, dict) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get('slug') == vslug and item.get('source'):
+                return item['source'], None
+
+        return None, (f"no m3u8 source found for vod '{vslug}' on channel '{slug}' "
+                      f"({len(items)} videos returned)")
+
     def _build_strategy_list(self, has_cookies: bool = True):
         """Return the ordered list of (name, kind, kwargs) strategy tuples."""
         strategies = []
@@ -1856,6 +1927,8 @@ class YouTubeDownloader:
             r2_bucket = r2_bucket or os.environ.get('R2_BUCKET', 'video-editor')
             has_cookies = bool(self.cookies_file)
             strategies = self._build_strategy_list(has_cookies=has_cookies)
+            if self._parse_kick_vod(video_url):
+                strategies.insert(0, ("kick VOD m3u8 (v2 API → HLS)", "kick", {}))
             total = len(strategies)
 
             logger.info(f"🚀 Starting R2 stream download with {total} strategies: {video_url}")
@@ -1907,6 +1980,17 @@ class YouTubeDownloader:
                             r2_url, metadata, error_msg = await self._run_httpx_r2_stream(
                                 stream_url, r2_key, r2_bucket, meta,
                             )
+                    elif kind == "kick":
+                        m3u8, err = await self._resolve_kick_m3u8(video_url)
+                        if err:
+                            error_msg = err
+                        else:
+                            logger.info(f"🎬 Kick VOD resolved → HLS: {m3u8[:80]}...")
+                            r2_url, metadata, error_msg = await self._run_ytdlp_r2_stream(
+                                m3u8, r2_key, r2_bucket,
+                                player_clients=["web"], use_cookies=False,
+                                use_proxy=False,
+                            )
                     else:
                         # Skip strategies that can't stream (pytubefix, you_get, streamlink, nodriver, playwright)
                         error_msg = f"skipped (cannot stream to R2)"
@@ -1946,6 +2030,8 @@ class YouTubeDownloader:
 
             has_cookies = bool(self.cookies_file)
             strategies = self._build_strategy_list(has_cookies=has_cookies)
+            if self._parse_kick_vod(video_url):
+                strategies.insert(0, ("kick VOD m3u8 (v2 API → HLS)", "kick", {}))
 
             total = len(strategies)
 
@@ -2017,6 +2103,17 @@ class YouTubeDownloader:
                         file_path, metadata, error_msg = await self._run_streamlink_strategy(
                             video_url, job_dir,
                         )
+                    elif kind == "kick":
+                        m3u8, err = await self._resolve_kick_m3u8(video_url)
+                        if err:
+                            error_msg = err
+                        else:
+                            logger.info(f"🎬 Kick VOD resolved → HLS: {m3u8[:80]}...")
+                            file_path, metadata, error_msg = await self._run_ytdlp_strategy(
+                                m3u8, output_path, format_selector,
+                                player_clients=["web"], use_cookies=False,
+                                skip_webpage=True, use_proxy=False,
+                            )
                 except Exception as e:
                     error_msg = f"Unexpected exception in strategy: {e}"
 
