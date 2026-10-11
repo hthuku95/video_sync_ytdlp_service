@@ -653,10 +653,34 @@ class YouTubeDownloader:
             return
         try:
             s3 = self._get_r2_client()
-            await asyncio.to_thread(
-                s3.copy_object, Bucket=bucket, Key=obj_key,
-                CopySource={'Bucket': bucket, 'Key': src_key},
-            )
+            head = await asyncio.to_thread(s3.head_object, Bucket=bucket, Key=src_key)
+            size = int(head.get('ContentLength', 0))
+            # Single COPY caps at 5GB — multipart-copy anything bigger.
+            if size > 0 and size < 5 * 1024 ** 3 - 1024 ** 2:
+                await asyncio.to_thread(
+                    s3.copy_object, Bucket=bucket, Key=obj_key,
+                    CopySource={'Bucket': bucket, 'Key': src_key},
+                )
+            else:
+                mpu = await asyncio.to_thread(
+                    s3.create_multipart_upload, Bucket=bucket, Key=obj_key)
+                upload_id = mpu['UploadId']
+                part_size = 512 * 1024 ** 2
+                parts = []
+                part_no = 1
+                for start in range(0, size, part_size):
+                    end = min(start + part_size - 1, size - 1)
+                    cp = await asyncio.to_thread(
+                        s3.upload_part_copy, Bucket=bucket, Key=obj_key,
+                        UploadId=upload_id, PartNumber=part_no,
+                        CopySource={'Bucket': bucket, 'Key': src_key},
+                        CopySourceRange=f"bytes={start}-{end}",
+                    )
+                    parts.append({'PartNumber': part_no, 'ETag': cp['CopyPartResult']['ETag'].strip('"')})
+                    part_no += 1
+                await asyncio.to_thread(
+                    s3.complete_multipart_upload, Bucket=bucket, Key=obj_key,
+                    UploadId=upload_id, MultipartUpload={'Parts': parts})
             if metadata is not None:
                 await self.store_source_meta(cache_key, metadata, bucket)
             logger.info(f"♻️ source cache populated: {cache_key}")
