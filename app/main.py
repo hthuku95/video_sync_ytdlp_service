@@ -5,6 +5,7 @@ High-performance YouTube download microservice for video_editor backend
 
 import os
 import time
+import asyncio
 import base64
 import logging
 from pathlib import Path
@@ -28,6 +29,9 @@ from .models import (
     VideoMetadata,
     ErrorCode,
     ErrorDetail,
+    AsyncDownloadStatus,
+    AsyncSubmitResponse,
+    AsyncStatusResponse,
 )
 from .downloader import downloader
 from .proxy_manager import proxy_manager
@@ -239,6 +243,163 @@ async def download_video(
         )
     finally:
         stats["active_downloads"] -= 1
+
+
+# ============================================================================
+# ASYNC DOWNLOAD JOBS (background VOD pulls — no long-lived HTTP request)
+# ============================================================================
+# Large VOD downloads stall past every proxy timeout in the chain, so the
+# Rust side submits here and polls short status requests instead of holding
+# one HTTP request open. In-memory registry (single uvicorn worker); jobs
+# prune after 24h. Cancelling kills the yt-dlp subprocess via the
+# BaseException-kill path in _run_ytdlp_r2_stream (no orphan pileups).
+ASYNC_JOBS: dict = {}
+ASYNC_JOB_TTL_SECONDS = 24 * 3600
+ASYNC_MAX_JOBS = 200
+
+
+def _prune_async_jobs() -> None:
+    now = time.time()
+    stale = [jid for jid, j in ASYNC_JOBS.items() if now - j.get("updated_at", now) > ASYNC_JOB_TTL_SECONDS]
+    for jid in stale:
+        ASYNC_JOBS.pop(jid, None)
+    while len(ASYNC_JOBS) > ASYNC_MAX_JOBS:
+        ASYNC_JOBS.pop(next(iter(ASYNC_JOBS)), None)
+
+
+def _async_job_public(job_id: str) -> dict:
+    j = ASYNC_JOBS.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="unknown async download job")
+    out = {
+        "job_id": job_id,
+        "status": j["status"].value if isinstance(j["status"], AsyncDownloadStatus) else j["status"],
+        "method": j.get("method"),
+        "r2_url": j.get("r2_url"),
+        "metadata": j.get("metadata"),
+        "error": j.get("error"),
+        "cached": bool(j.get("cached")),
+    }
+    return out
+
+
+async def _run_async_download(job_id: str, request: DownloadRequest) -> None:
+    """Background worker: cache-check → download → store. Never raises."""
+    job = ASYNC_JOBS.get(job_id)
+    if not job:
+        return
+    job["status"] = AsyncDownloadStatus.RUNNING
+    job["updated_at"] = time.time()
+    r2_bucket = request.r2_bucket or os.environ.get('R2_BUCKET', 'video-editor')
+    try:
+        # Shared source cache: an earlier attempt may already have this VOD.
+        if request.cache_key:
+            cached_url, cached_meta = await downloader.check_source_cache(
+                request.cache_key, r2_bucket
+            )
+            if cached_url:
+                job.update({
+                    "status": AsyncDownloadStatus.DONE,
+                    "method": "r2",
+                    "r2_url": cached_url,
+                    "metadata": cached_meta.model_dump(mode='json') if cached_meta else None,
+                    "cached": True,
+                    "updated_at": time.time(),
+                })
+                stats["total_downloads"] += 1
+                return
+        timeout = request.timeout_seconds or 5400
+        file_path, r2_url, metadata, error = await asyncio.wait_for(
+            downloader.download(
+                video_url=request.video_url,
+                job_id=job_id,
+                quality=request.quality,
+                output_format=request.format,
+                timeout_seconds=timeout,
+                only_strategy=request.only_strategy,
+                r2_key=request.r2_key,
+                r2_bucket=request.r2_bucket,
+            ),
+            timeout=timeout,
+        )
+        if error or not r2_url:
+            msg = (error.message if error else None) or "download produced no R2 URL"
+            stats["failed_downloads"] += 1
+            job.update({"status": AsyncDownloadStatus.FAILED, "error": msg, "updated_at": time.time()})
+            return
+        # Persist metadata sidecar so future cache hits return metadata too.
+        if request.cache_key and metadata is not None:
+            try:
+                await downloader.store_source_meta(request.cache_key, metadata, r2_bucket)
+            except Exception as meta_err:
+                logger.warning(f"async job {job_id}: meta store failed: {meta_err}")
+        stats["total_downloads"] += 1
+        job.update({
+            "status": AsyncDownloadStatus.DONE,
+            "method": "r2",
+            "r2_url": r2_url,
+            "metadata": metadata.model_dump(mode='json') if metadata is not None else None,
+            "updated_at": time.time(),
+        })
+    except asyncio.TimeoutError:
+        stats["failed_downloads"] += 1
+        job.update({
+            "status": AsyncDownloadStatus.FAILED,
+            "error": f"async download timed out after {request.timeout_seconds or 5400}s (transient — retry)",
+            "updated_at": time.time(),
+        })
+    except asyncio.CancelledError:
+        job.update({"status": AsyncDownloadStatus.CANCELLED, "updated_at": time.time()})
+        raise
+    except Exception as e:
+        stats["failed_downloads"] += 1
+        logger.exception(f"async job {job_id} crashed: {e}")
+        job.update({"status": AsyncDownloadStatus.FAILED, "error": f"Internal error: {e}", "updated_at": time.time()})
+
+
+@app.post("/api/v1/download-async", status_code=202)
+async def submit_async_download(request: DownloadRequest):
+    """Submit a background VOD download. Poll GET /api/v1/download-async/{job_id}."""
+    _prune_async_jobs()
+    job_id = request.job_id or f"adl_{int(time.time() * 1000)}"
+    if job_id in ASYNC_JOBS and ASYNC_JOBS[job_id]["status"] in (
+        AsyncDownloadStatus.QUEUED, AsyncDownloadStatus.RUNNING,
+    ):
+        return JSONResponse(status_code=200, content={"job_id": job_id, "status": "queued"})
+    task = asyncio.create_task(_run_async_download(job_id, request))
+    ASYNC_JOBS[job_id] = {
+        "status": AsyncDownloadStatus.QUEUED,
+        "task": task,
+        "request": request.model_dump(),
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+    logger.info(f"📥 async download submitted: {request.video_url} (job_id={job_id})")
+    return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued"})
+
+
+@app.get("/api/v1/download-async/{job_id}")
+async def async_download_status(job_id: str):
+    """Poll a background download job (short request — proxy-timeout safe)."""
+    return JSONResponse(content=_async_job_public(job_id))
+
+
+@app.delete("/api/v1/download-async/{job_id}")
+async def cancel_async_download(job_id: str):
+    """Cancel a background download (kills the yt-dlp subprocess)."""
+    job = ASYNC_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown async download job")
+    task = job.get("task")
+    if task and not task.done():
+        task.cancel()
+    job["status"] = AsyncDownloadStatus.CANCELLED
+    job["updated_at"] = time.time()
+    try:
+        storage.delete_job_files(job_id)
+    except Exception as cleanup_err:
+        logger.warning(f"async cancel cleanup error for {job_id}: {cleanup_err}")
+    return JSONResponse(content={"job_id": job_id, "status": "cancelled"})
 
 
 @app.get("/downloads/{job_id}/{filename}")

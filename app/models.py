@@ -30,6 +30,7 @@ class DownloadRequest(BaseModel):
     only_strategy: Optional[int] = Field(None, description="Run only this strategy number (1-based). Use GET /api/v1/strategies to list available strategies.")
     r2_key: Optional[str] = Field(None, description="R2 storage key — if set, stream directly to R2 (zero local disk)")
     r2_bucket: Optional[str] = Field(None, description="R2 bucket name (defaults to R2_BUCKET env var)")
+    cache_key: Optional[str] = Field(None, description="Content-hash of the canonical source URL — enables the shared R2 source cache (sources/{cache_key}/source.mp4) so repeated attempts reuse one download")
 
     class Config:
         json_schema_extra = {
@@ -124,3 +125,29 @@ class HealthResponse(BaseModel):
     uptime_seconds: float
     stats: HealthStats
     yt_dlp_version: str
+
+
+class AsyncDownloadStatus(str, Enum):
+    """Lifecycle of a background download job (/api/v1/download-async)"""
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class AsyncSubmitResponse(BaseModel):
+    """Immediate response for POST /api/v1/download-async"""
+    job_id: str
+    status: AsyncDownloadStatus = AsyncDownloadStatus.QUEUED
+
+
+class AsyncStatusResponse(BaseModel):
+    """Poll response for GET /api/v1/download-async/{job_id}"""
+    job_id: str
+    status: AsyncDownloadStatus
+    method: Optional[str] = None
+    r2_url: Optional[str] = None
+    metadata: Optional[VideoMetadata] = None
+    error: Optional[str] = None
+    cached: bool = False

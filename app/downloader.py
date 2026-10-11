@@ -61,6 +61,7 @@ Environment variables:
 
 import asyncio
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -407,6 +408,59 @@ class YouTubeDownloader:
             region_name='auto',
         )
 
+    @staticmethod
+    def source_cache_keys(cache_key: str) -> tuple:
+        """Canonical R2 locations for a content-hashed source VOD."""
+        return f"sources/{cache_key}/source.mp4", f"sources/{cache_key}/meta.json"
+
+    async def check_source_cache(self, cache_key: str, r2_bucket: Optional[str] = None):
+        """Shared VOD cache: return (fresh_presigned_url, metadata) on hit,
+        else (None, None). A hit means some earlier attempt already pulled
+        this exact source — retries reuse it instead of re-downloading."""
+        bucket = r2_bucket or os.environ.get('R2_BUCKET', 'video-editor')
+        obj_key, meta_key = self.source_cache_keys(cache_key)
+        try:
+            s3 = self._get_r2_client()
+        except Exception as e:
+            logger.warning(f"source cache unavailable (R2 creds): {e}")
+            return None, None
+        try:
+            await asyncio.to_thread(s3.head_object, Bucket=bucket, Key=obj_key)
+        except Exception:
+            return None, None  # miss — covers 404 and any access problem
+        metadata = None
+        try:
+            resp = await asyncio.to_thread(s3.get_object, Bucket=bucket, Key=meta_key)
+            metadata = VideoMetadata(**json.loads(resp['Body'].read().decode('utf-8')))
+        except Exception as e:
+            logger.warning(f"source cache meta miss for {cache_key}: {e}")
+        try:
+            presigned = await asyncio.to_thread(
+                s3.generate_presigned_url,
+                'get_object',
+                Params={'Bucket': bucket, 'Key': obj_key},
+                ExpiresIn=7 * 24 * 3600,
+            )
+        except Exception as e:
+            logger.warning(f"source cache presign failed for {cache_key}: {e}")
+            return None, None
+        logger.info(f"♻️ source cache HIT: {cache_key}")
+        return presigned, metadata
+
+    async def store_source_meta(self, cache_key: str, metadata, r2_bucket: Optional[str] = None) -> None:
+        """Persist the metadata sidecar next to a cached source object."""
+        bucket = r2_bucket or os.environ.get('R2_BUCKET', 'video-editor')
+        _, meta_key = self.source_cache_keys(cache_key)
+        try:
+            s3 = self._get_r2_client()
+            body = json.dumps(metadata.model_dump(mode='json')).encode('utf-8')
+            await asyncio.to_thread(
+                s3.put_object, Bucket=bucket, Key=meta_key, Body=body,
+                ContentType='application/json',
+            )
+        except Exception as e:
+            logger.warning(f"source cache meta store failed for {cache_key}: {e}")
+
     async def _stream_to_r2(self, r2_key: str, r2_bucket: str, chunk_generator) -> str:
         """Multipart upload a stream of byte chunks to R2. Returns presigned GET URL."""
         s3 = self._get_r2_client()
@@ -561,13 +615,18 @@ class YouTubeDownloader:
 
         try:
             r2_url = await self._stream_to_r2(r2_key, r2_bucket, chunk_generator())
-        except Exception as e:
-            # Kill yt-dlp process on failure
+        except BaseException as e:
+            # Kill yt-dlp on ANY exit path — asyncio cancellation raises
+            # CancelledError (BaseException, not Exception), which used to
+            # bypass the kill and orphan the subprocess (Oct 11 pileup:
+            # stalled yt-dlp procs at ~0 CPU accumulating per attempt).
             try:
                 process.kill()
             except Exception:
                 pass
-            return None, None, f"R2 streaming failed: {e}"
+            if isinstance(e, Exception):
+                return None, None, f"R2 streaming failed: {e}"
+            raise
 
         # Wait for yt-dlp to finish and check for errors
         returncode = await process.wait()
