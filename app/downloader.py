@@ -674,8 +674,8 @@ class YouTubeDownloader:
             free = shutil.disk_usage("/tmp").free
         except Exception:
             free = 0
-        if free < 12 * 1024 ** 3:
-            return None, None, f"disk guard: only {free / 1e9:.1f}GB free, need 12GB"
+        if free < 4 * 1024 ** 3:
+            return None, None, f"disk guard: only {free / 1e9:.1f}GB free, need 4GB"
         fb_job = f"{job_id}-fb"
         job_dir = storage.get_job_dir(fb_job)
         output_path = job_dir / f"video.{output_format}"
