@@ -547,6 +547,11 @@ class YouTubeDownloader:
                '--format', 'best[ext=mp4]/best',
                '-o', '-',
                '--no-playlist',
+               # HLS pulls get per-connection throttled to ~0 mid-VOD; parallel
+               # fragments keep total throughput alive (ignored for progressive).
+               '--concurrent-fragments', '8',
+               '--fragment-retries', '25',
+               '--retries', '25',
                '--user-agent',
                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                '--no-check-certificates',

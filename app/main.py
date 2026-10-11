@@ -367,11 +367,21 @@ async def submit_async_download(request: DownloadRequest):
         AsyncDownloadStatus.QUEUED, AsyncDownloadStatus.RUNNING,
     ):
         return JSONResponse(status_code=200, content={"job_id": job_id, "status": "queued"})
+    # Dedupe: same source already pulling → attach to the live job instead of
+    # opening a duplicate throttled stream (Oct 11: 8 concurrent pulls of one VOD).
+    if request.cache_key:
+        for jid, j in ASYNC_JOBS.items():
+            if j.get("cache_key") == request.cache_key and j.get("status") in (
+                AsyncDownloadStatus.QUEUED, AsyncDownloadStatus.RUNNING,
+            ):
+                logger.info(f"📎 async download deduped onto live job {jid} (cache_key hit)")
+                return JSONResponse(status_code=200, content={"job_id": jid, "status": "queued"})
     task = asyncio.create_task(_run_async_download(job_id, request))
     ASYNC_JOBS[job_id] = {
         "status": AsyncDownloadStatus.QUEUED,
         "task": task,
         "request": request.model_dump(),
+        "cache_key": request.cache_key,
         "created_at": time.time(),
         "updated_at": time.time(),
     }
