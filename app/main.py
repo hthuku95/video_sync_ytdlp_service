@@ -319,6 +319,7 @@ async def _run_async_download(job_id: str, request: DownloadRequest) -> None:
                 only_strategy=request.only_strategy,
                 r2_key=request.r2_key,
                 r2_bucket=request.r2_bucket,
+                cache_key=request.cache_key,
             ),
             timeout=timeout,
         )

@@ -640,6 +640,108 @@ class YouTubeDownloader:
         logger.info(f"✅ R2 stream complete: {r2_url}")
         return r2_url, metadata, None
 
+    async def _populate_source_cache(self, cache_key, r2_bucket, src_key, metadata) -> None:
+        """Server-side copy of a fresh download into the shared content-hash
+        cache + metadata sidecar. Instant (no re-download); best-effort."""
+        if not cache_key or not src_key:
+            return
+        bucket = r2_bucket or os.environ.get('R2_BUCKET', 'video-editor')
+        obj_key, _ = self.source_cache_keys(cache_key)
+        if obj_key == src_key:
+            if metadata is not None:
+                await self.store_source_meta(cache_key, metadata, bucket)
+            return
+        try:
+            s3 = self._get_r2_client()
+            await asyncio.to_thread(
+                s3.copy_object, Bucket=bucket, Key=obj_key,
+                CopySource={'Bucket': bucket, 'Key': src_key},
+            )
+            if metadata is not None:
+                await self.store_source_meta(cache_key, metadata, bucket)
+            logger.info(f"♻️ source cache populated: {cache_key}")
+        except Exception as e:
+            logger.warning(f"source cache populate failed for {cache_key}: {e}")
+
+    async def _run_file_then_r2(
+        self, video_url: str, job_id: str, quality: str,
+        output_format: str, r2_key: str, r2_bucket: str,
+    ) -> tuple:
+        """Download to a temp file with plain yt-dlp, then upload to R2.
+        Disk-guarded (needs 12GB free) and always cleaned up."""
+        import shutil
+        try:
+            free = shutil.disk_usage("/tmp").free
+        except Exception:
+            free = 0
+        if free < 12 * 1024 ** 3:
+            return None, None, f"disk guard: only {free / 1e9:.1f}GB free, need 12GB"
+        fb_job = f"{job_id}-fb"
+        job_dir = storage.get_job_dir(fb_job)
+        output_path = job_dir / f"video.{output_format}"
+        format_selector = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
+        opts = self._build_ytdlp_opts(
+            player_clients=["android"], use_cookies=False, skip_webpage=True,
+            output_path=str(output_path), format_selector=format_selector,
+            use_proxy=False,
+        )
+
+        def _do_download():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(video_url, download=True)
+
+        try:
+            info = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, _do_download),
+                timeout=3600,
+            )
+        except asyncio.TimeoutError:
+            try:
+                storage.delete_job_files(fb_job)
+            except Exception:
+                pass
+            return None, None, "file-fallback timed out after 60 minutes"
+        except Exception as e:
+            try:
+                storage.delete_job_files(fb_job)
+            except Exception:
+                pass
+            return None, None, str(e)[:300]
+
+        actual = output_path
+        if not actual.exists():
+            candidates = sorted(job_dir.glob("video.*"), key=lambda p: p.stat().st_size, reverse=True)
+            actual = candidates[0] if candidates else None
+        if actual is None or not actual.exists() or actual.stat().st_size < 50000:
+            try:
+                storage.delete_job_files(fb_job)
+            except Exception:
+                pass
+            return None, None, "file-fallback produced no usable file"
+        metadata = self._extract_metadata_from_ytdlp(info or {})
+        metadata.file_size_bytes = actual.stat().st_size
+        try:
+            s3 = self._get_r2_client()
+            await asyncio.to_thread(s3.upload_file, str(actual), r2_bucket, r2_key)
+            presigned = await asyncio.to_thread(
+                s3.generate_presigned_url,
+                'get_object',
+                Params={'Bucket': r2_bucket, 'Key': r2_key},
+                ExpiresIn=7 * 24 * 3600,
+            )
+        except Exception as e:
+            try:
+                storage.delete_job_files(fb_job)
+            except Exception:
+                pass
+            return None, None, f"R2 upload failed: {e}"[:300]
+        try:
+            storage.delete_job_files(fb_job)
+        except Exception:
+            pass
+        logger.info(f"✅ file-fallback complete: {r2_key}")
+        return presigned, metadata, None
+
     async def _run_httpx_r2_stream(
         self,
         stream_url: str,
@@ -1966,6 +2068,7 @@ class YouTubeDownloader:
         only_strategy: Optional[int] = None,
         r2_key: Optional[str] = None,
         r2_bucket: Optional[str] = None,
+        cache_key: Optional[str] = None,
     ) -> tuple[Optional[Path], Optional[str], Optional[VideoMetadata], Optional[ErrorDetail]]:
         """
         Download a YouTube video using up to 16 strategies with automatic fallback.
@@ -2058,6 +2161,7 @@ class YouTubeDownloader:
 
                 if r2_url:
                     logger.info(f"✅ R2 strategy {idx}/{total} ({name}) succeeded: {r2_url[:80]}...")
+                    await self._populate_source_cache(cache_key, r2_bucket, r2_key, metadata)
                     return None, r2_url, metadata, None
 
                 error_summary = error_msg or "unknown error"
@@ -2069,6 +2173,17 @@ class YouTubeDownloader:
                     last_error = classified
                     if self._is_permanent_error(classified):
                         break
+
+            # Fallback: proven file-based path → upload to R2. The streaming
+            # pipe can fail on flaky edges while plain yt-dlp file downloads
+            # succeed (Oct 11: 64MB/s direct). Disk-guarded, always cleaned up.
+            fb_url, fb_meta, fb_err = await self._run_file_then_r2(
+                video_url, job_id, quality, output_format, r2_key, r2_bucket)
+            if fb_url:
+                logger.info(f"✅ file-fallback succeeded: {fb_url[:80]}...")
+                await self._populate_source_cache(cache_key, r2_bucket, r2_key, fb_meta)
+                return None, fb_url, fb_meta, None
+            all_errors.append(f"[file-fallback]: {(fb_err or 'unknown error')[:200]}")
 
             logger.error(f"❌ All {total} R2 strategies failed for {video_url}")
             if last_error:
