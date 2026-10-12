@@ -602,11 +602,18 @@ class YouTubeDownloader:
         title = info.get('title', 'Unknown')
         logger.info(f"📥 R2 stream: downloading '{title}' via yt-dlp subprocess → R2 ({r2_key})")
 
-        # Spawn yt-dlp with stdout pipe
+        # Spawn yt-dlp with stdout pipe. --concurrent-fragments spills
+        # per-fragment files (--Frag*) into the child CWD, so isolate each
+        # run in its own temp dir (Oct 11: 8GB of orphan frags filled the
+        # 29GB box when jobs died mid-pull). Always removed afterwards.
+        import tempfile as _tf
+        import shutil as _sh
+        frag_dir = _tf.mkdtemp(prefix="fragpipe-")
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            cwd=frag_dir,
         )
 
         async def chunk_generator():
@@ -629,12 +636,20 @@ class YouTubeDownloader:
                 process.kill()
             except Exception:
                 pass
+            try:
+                _sh.rmtree(frag_dir, ignore_errors=True)
+            except Exception:
+                pass
             if isinstance(e, Exception):
                 return None, None, f"R2 streaming failed: {e}"
             raise
 
         # Wait for yt-dlp to finish and check for errors
         returncode = await process.wait()
+        try:
+            _sh.rmtree(frag_dir, ignore_errors=True)
+        except Exception:
+            pass
         if returncode != 0:
             stderr = (await process.stderr.read()).decode('utf-8', errors='replace') if process.stderr else ''
             logger.warning(f"⚠️ yt-dlp exit code {returncode}: {stderr[:200]}")
