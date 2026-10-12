@@ -591,6 +591,14 @@ class YouTubeDownloader:
                 lambda: yt_dlp.YoutubeDL(meta_opts).extract_info(video_url, download=False)
             )
         except Exception as e:
+            import traceback as _tb
+            logger.error(
+                "🧪 META-DEBUG url=%s proxy_opt=%r pool=%d env_proxy=%r\n%s",
+                video_url, meta_opts.get("proxy"),
+                len(proxy_manager._proxies),
+                {k: v[:24] for k, v in os.environ.items() if "proxy" in k.lower()},
+                _tb.format_exc()[-3000:],
+            )
             return None, None, f"yt-dlp metadata extraction failed: {e}"
 
         if not info:
