@@ -1586,17 +1586,34 @@ class YouTubeDownloader:
             return actual_path, metadata, None
 
         loop = asyncio.get_event_loop()
+        # Env-hygiene: _do_download injects HTTP(S)_PROXY for you-get. A stale
+        # pool proxy there permanently poisons the worker process — every later
+        # yt-dlp call tunnels through the dead proxy (Oct 11: instant 402
+        # bursts on identical calls that succeed in a fresh shell).
+        # Snapshot + restore no matter how the download ends.
+        prev_http_proxy = os.environ.get("HTTP_PROXY")
+        prev_https_proxy = os.environ.get("HTTPS_PROXY")
         try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, _do_download),
-                timeout=300,
-            )
-        except asyncio.TimeoutError:
-            return None, None, "you-get strategy timed out after 5 minutes"
-        except Exception as e:
-            return None, None, str(e)
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(None, _do_download),
+                    timeout=300,
+                )
+            except asyncio.TimeoutError:
+                return None, None, "you-get strategy timed out after 5 minutes"
+            except Exception as e:
+                return None, None, str(e)
 
-        return result
+            return result
+        finally:
+            if prev_http_proxy is None:
+                os.environ.pop("HTTP_PROXY", None)
+            else:
+                os.environ["HTTP_PROXY"] = prev_http_proxy
+            if prev_https_proxy is None:
+                os.environ.pop("HTTPS_PROXY", None)
+            else:
+                os.environ["HTTPS_PROXY"] = prev_https_proxy
 
     async def _run_nodriver_strategy(
         self,
