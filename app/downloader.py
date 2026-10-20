@@ -421,16 +421,23 @@ class YouTubeDownloader:
         import boto3
 
         bucket = os.environ.get('S3_FALLBACK_BUCKET', '').strip()
+        if not bucket:
+            return None, None
         access_key = os.environ.get('S3_FALLBACK_ACCESS_KEY_ID', '').strip()
         secret_key = os.environ.get('S3_FALLBACK_SECRET_ACCESS_KEY', '').strip()
-        if not bucket or not access_key or not secret_key:
-            return None, None
-        client = boto3.client(
-            's3',
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            region_name=os.environ.get('S3_REGION', 'us-east-1'),
-        )
+        region = os.environ.get('S3_REGION', 'us-east-1')
+        if access_key and secret_key:
+            client = boto3.client(
+                's3',
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                region_name=region,
+            )
+        else:
+            # No static keys configured: fall through to the ambient credential
+            # chain (the EC2 instance profile), which keeps a long-lived secret
+            # off the box. The profile carries a scoped inline policy.
+            client = boto3.client('s3', region_name=region)
         return client, bucket
 
     def _storage_targets(self, preferred_bucket: Optional[str] = None):
