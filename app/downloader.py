@@ -409,6 +409,50 @@ class YouTubeDownloader:
         )
 
     @staticmethod
+    def _get_s3_fallback_client():
+        """boto3 client for the S3 fallback bucket, or (None, None).
+
+        Mirrors the Rust StorageRouter contract (R2 primary, S3 secondary) so a
+        Cloudflare R2 billing/entitlement outage cannot stop downloads. R2
+        currently answers `403 Forbidden` on every request, and this service
+        previously had no secondary — every page-URL download (Twitch VODs,
+        YouTube) failed at the upload step, which is what broke clipping.
+        """
+        import boto3
+
+        bucket = os.environ.get('S3_FALLBACK_BUCKET', '').strip()
+        access_key = os.environ.get('S3_FALLBACK_ACCESS_KEY_ID', '').strip()
+        secret_key = os.environ.get('S3_FALLBACK_SECRET_ACCESS_KEY', '').strip()
+        if not bucket or not access_key or not secret_key:
+            return None, None
+        client = boto3.client(
+            's3',
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=os.environ.get('S3_REGION', 'us-east-1'),
+        )
+        return client, bucket
+
+    def _storage_targets(self, preferred_bucket: Optional[str] = None):
+        """Ordered `(client, bucket, label)` storage targets: R2, then S3."""
+        targets = []
+        try:
+            targets.append((
+                self._get_r2_client(),
+                preferred_bucket or os.environ.get('R2_BUCKET', 'video-editor'),
+                'r2',
+            ))
+        except Exception as e:
+            logger.warning(f"⚠️ R2 client unavailable: {e}")
+        try:
+            client, bucket = self._get_s3_fallback_client()
+            if client is not None:
+                targets.append((client, bucket, 's3-fallback'))
+        except Exception as e:
+            logger.warning(f"⚠️ S3 fallback client unavailable: {e}")
+        return targets
+
+    @staticmethod
     def source_cache_keys(cache_key: str) -> tuple:
         """Canonical R2 locations for a content-hashed source VOD."""
         return f"sources/{cache_key}/source.mp4", f"sources/{cache_key}/meta.json"
@@ -462,13 +506,43 @@ class YouTubeDownloader:
             logger.warning(f"source cache meta store failed for {cache_key}: {e}")
 
     async def _stream_to_r2(self, r2_key: str, r2_bucket: str, chunk_generator) -> str:
-        """Multipart upload a stream of byte chunks to R2. Returns presigned GET URL."""
-        s3 = self._get_r2_client()
+        """Multipart upload a stream of byte chunks to R2 (S3 fallback).
 
-        # Initiate multipart upload
-        mpu = await asyncio.to_thread(
-            s3.create_multipart_upload, Bucket=r2_bucket, Key=r2_key
-        )
+        Returns a presigned GET URL. The multipart upload is *initiated* before
+        any chunk is consumed, so a backend that refuses writes (e.g. R2
+        returning 403 during a billing/entitlement outage) is abandoned and the
+        next target is tried without having to replay the stream.
+        """
+        targets = self._storage_targets(r2_bucket)
+        if not targets:
+            raise RuntimeError(
+                "No storage backend configured: R2 credentials missing and "
+                "S3 fallback (S3_FALLBACK_BUCKET/ACCESS_KEY_ID/SECRET_ACCESS_KEY) unset"
+            )
+
+        s3 = None
+        bucket = None
+        mpu = None
+        last_err: Optional[Exception] = None
+        for client, target_bucket, label in targets:
+            try:
+                mpu = await asyncio.to_thread(
+                    client.create_multipart_upload, Bucket=target_bucket, Key=r2_key
+                )
+                s3, bucket = client, target_bucket
+                if label != 'r2':
+                    logger.warning(
+                        f"⚠️ R2 write refused — streaming {r2_key} to {label} "
+                        f"bucket '{target_bucket}' instead"
+                    )
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(f"⚠️ {label} multipart init failed for {r2_key}: {e}")
+
+        if mpu is None or s3 is None or bucket is None:
+            raise last_err or RuntimeError("No storage backend accepted the upload")
+
         upload_id = mpu['UploadId']
         parts: List[Dict[str, Any]] = []
         part_number = 1
@@ -483,7 +557,7 @@ class YouTubeDownloader:
                     del buf[:PART_SIZE]
                     part = await asyncio.to_thread(
                         s3.upload_part,
-                        Bucket=r2_bucket, Key=r2_key,
+                        Bucket=bucket, Key=r2_key,
                         UploadId=upload_id, PartNumber=part_number,
                         Body=part_data,
                     )
@@ -494,7 +568,7 @@ class YouTubeDownloader:
             if buf:
                 part = await asyncio.to_thread(
                     s3.upload_part,
-                    Bucket=r2_bucket, Key=r2_key,
+                    Bucket=bucket, Key=r2_key,
                     UploadId=upload_id, PartNumber=part_number,
                     Body=bytes(buf),
                 )
@@ -503,7 +577,7 @@ class YouTubeDownloader:
             # Complete multipart upload
             await asyncio.to_thread(
                 s3.complete_multipart_upload,
-                Bucket=r2_bucket, Key=r2_key,
+                Bucket=bucket, Key=r2_key,
                 UploadId=upload_id,
                 MultipartUpload={'Parts': parts},
             )
@@ -512,7 +586,7 @@ class YouTubeDownloader:
             try:
                 await asyncio.to_thread(
                     s3.abort_multipart_upload,
-                    Bucket=r2_bucket, Key=r2_key, UploadId=upload_id,
+                    Bucket=bucket, Key=r2_key, UploadId=upload_id,
                 )
             except Exception:
                 pass
@@ -522,7 +596,7 @@ class YouTubeDownloader:
         presigned = await asyncio.to_thread(
             s3.generate_presigned_url,
             'get_object',
-            Params={'Bucket': r2_bucket, 'Key': r2_key},
+            Params={'Bucket': bucket, 'Key': r2_key},
             ExpiresIn=7 * 24 * 3600,
         )
         return presigned
@@ -2310,6 +2384,16 @@ class YouTubeDownloader:
                         file_path, metadata, error_msg = await self._run_invidious_strategy(
                             video_url, job_dir, quality,
                             instance=kwargs["instance"],
+                        )
+                    elif kind == "piped":
+                        file_path, metadata, error_msg = await self._run_piped_strategy(
+                            video_url, job_dir, quality,
+                            instance=kwargs["instance"],
+                        )
+                    elif kind == "pytubefix":
+                        file_path, metadata, error_msg = await self._run_pytubefix_strategy(
+                            video_url, job_dir, quality,
+                            client_name=kwargs["client_name"],
                         )
                     elif kind == "piped":
                         file_path, metadata, error_msg = await self._run_piped_strategy(
